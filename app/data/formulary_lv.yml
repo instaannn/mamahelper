@@ -1,0 +1,45 @@
+country: LV
+updated_at: "2025-09-05"
+drugs:
+  paracetamol:
+    display_name: "Парацетамол"
+    min_age_months: 3
+    mg_per_kg_single_dose_range: [15, 15]   # фикс: 15 мг/кг на приём
+    min_interval_hours: 4                    # 4–6 часов → берём нижнюю границу как минимум
+    max_daily_mg_per_kg: 60                  # максимум за сутки
+    routes:
+      oral:
+        min_ml_step: 0.5
+        fixed_concentrations:
+          - label: "120 мг/5 мл"
+            mg_per_ml: 24                   # 120 мг / 5 мл
+
+  ibuprofen:
+    display_name: "Ибупрофен"
+    min_age_months: 3
+    mg_per_kg_single_dose_range: [10, 10]   # ранее мы зафиксировали 10 мг/кг
+    min_interval_hours: 6                    # 6–8 часов
+    max_daily_mg_per_kg: 30
+    routes:
+      oral:
+        min_ml_step: 0.5
+        fixed_concentrations:
+          - label: "100 мг/5 мл"
+            mg_per_ml: 20
+            age_band_ml:
+              - { min_months: 3,  max_months: 5,   ml: 2.5 }
+              - { min_months: 6,  max_months: 11,  ml: 2.5 }
+              - { min_months: 12, max_months: 35,  ml: 5.0 }
+              - { min_months: 36, max_months: 71,  ml: 7.5 }
+              - { min_months: 72, max_months: 119, ml: 10.0 }
+              - { min_months: 120,max_months: 155, ml: 15.0 }
+          - label: "200 мг/5мл (40 мг/мл)"
+            mg_per_ml: 40
+            min_age_months: 12
+            min_weight_kg: 10
+            age_band_ml:
+              - { min_months: 12, max_months: 35,  ml: 2.5 }
+              - { min_months: 36, max_months: 71,  ml: 3.75 }
+              - { min_months: 72, max_months: 119, ml: 5.0 }
+              - { min_months: 120,max_months: 155, ml: 7.5 }
+              - { min_months: 156,max_months: 999, ml: 7.5 }
