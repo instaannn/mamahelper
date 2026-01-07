@@ -1,0 +1,39 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mamahelper_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mamahelper}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-mamahelper}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mamahelper}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    volumes:
+      - ./app/data:/app/app/data
+    environment:
+      # Переопределяем DATABASE_URL для использования PostgreSQL
+      DATABASE_URL: postgresql://${POSTGRES_USER:-mamahelper}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-mamahelper}
+
+volumes:
+  postgres_data:
+

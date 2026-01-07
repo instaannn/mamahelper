@@ -68,8 +68,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"Received /start command from user {update.effective_user.id}")
     try:
-        # Отслеживаем взаимодействие пользователя
-        await track_user_interaction(update.effective_user.id)
+        # Отслеживаем взаимодействие пользователя (не критично, если не получится)
+        try:
+            await track_user_interaction(update.effective_user.id)
+        except Exception as track_error:
+            logging.warning(f"⚠️ Ошибка при отслеживании взаимодействия пользователя {update.effective_user.id}: {track_error}")
+            # Продолжаем выполнение, это не критично
         
         user = update.effective_user
         # Используем имя профиля (first_name), если нет - username, если нет - "друг"
@@ -88,7 +92,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         has_events = await has_dose_events(user.id)
         
         # Проверяем премиум-статус (подписка на бота, не Telegram Premium)
-        is_premium = await is_premium_user(user.id)
+        try:
+            is_premium = await is_premium_user(user.id)
+        except Exception as premium_check_error:
+            logging.error(f"❌ Ошибка при проверке премиум-статуса для user {user.id}: {premium_check_error}", exc_info=True)
+            # В случае ошибки считаем, что премиум нет
+            is_premium = False
         
         # Если нет профиля и нет записей - это первый визит
         # Но если премиум-статус True, возможно остались старые данные - сбрасываем

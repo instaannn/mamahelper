@@ -211,11 +211,8 @@ def save_feedback(text: str, meta: dict) -> None:
 # ---------- База данных (SQLite) ----------
 async def init_db() -> None:
     """Инициализация БД: создание таблиц при первом запуске."""
-    async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT) as db:
-        # Включаем WAL mode для лучшей производительности и меньших блокировок
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA busy_timeout=30000")  # 30 секунд timeout
-        await db.commit()
+    db = await _get_db_connection()
+    try:
         # Таблица профилей детей
         await db.execute("""
             CREATE TABLE IF NOT EXISTS child_profiles (
@@ -363,6 +360,8 @@ async def init_db() -> None:
         """)
         
         await db.commit()
+    finally:
+        await db.close()
 
 async def get_child_profile(user_id: int, profile_id: Optional[int] = None) -> Optional[ChildProfile]:
     """Получить профиль ребенка для пользователя.
@@ -522,6 +521,44 @@ async def delete_child_profile(user_id: int, profile_id: Optional[int] = None) -
         await db.commit()
         return cursor.rowcount > 0
 
+# ---------- Вспомогательные функции для работы с БД ----------
+async def _get_db_connection():
+    """
+    Создать подключение к БД с оптимизированными настройками.
+    Используйте эту функцию для всех подключений вместо прямого вызова aiosqlite.connect.
+    """
+    db = await aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT)
+    # Оптимизация SQLite для лучшей производительности и меньших блокировок
+    await db.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging
+    await db.execute("PRAGMA synchronous=NORMAL")  # Баланс между скоростью и надежностью
+    await db.execute("PRAGMA busy_timeout=30000")  # 30 секунд timeout
+    await db.execute("PRAGMA cache_size=-64000")  # 64MB кэш (отрицательное значение в KB)
+    await db.execute("PRAGMA temp_store=MEMORY")  # Временные таблицы в памяти
+    await db.execute("PRAGMA mmap_size=268435456")  # 256MB memory-mapped I/O
+    await db.execute("PRAGMA foreign_keys=ON")  # Включаем внешние ключи
+    await db.commit()
+    return db
+
+async def _db_connect_with_retry():
+    """
+    Подключиться к БД с повторными попытками при блокировке.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await _get_db_connection()
+        except aiosqlite.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)  # Экспоненциальная задержка
+                logging.warning(f"⚠️ БД заблокирована, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logging.error(f"❌ Ошибка подключения к БД: {e}")
+                raise
+        except Exception as e:
+            logging.error(f"❌ Ошибка подключения к БД: {e}")
+            raise
+
 # ---------- Премиум-подписка пользователей ----------
 async def is_user_premium(user_id: int) -> bool:
     """Проверить, есть ли у пользователя премиум-подписка бота."""
@@ -578,19 +615,21 @@ async def is_user_premium(user_id: int) -> bool:
                 await asyncio.sleep(delay)
                 continue
             else:
-                logging.error(f"❌ Ошибка БД при проверке премиума для user_id={user_id}: {e}")
-                raise
+                # В случае ошибки БД считаем, что премиум нет (безопасный вариант)
+                logging.warning(f"⚠️ Ошибка БД при проверке премиума для user_id={user_id}: {e}, возвращаем False")
+                return False
         except Exception as e:
             if db:
                 try:
                     await db.close()
                 except:
                     pass
-            logging.error(f"❌ Неожиданная ошибка при проверке премиума для user_id={user_id}: {e}", exc_info=True)
-            raise
+            # В случае любой ошибки считаем, что премиум нет (безопасный вариант)
+            logging.warning(f"⚠️ Ошибка при проверке премиума для user_id={user_id}: {e}, возвращаем False")
+            return False
     
     # Если все попытки исчерпаны
-    logging.error(f"❌ Не удалось проверить премиум для user_id={user_id} после {MAX_RETRIES} попыток")
+    logging.warning(f"⚠️ Не удалось проверить премиум для user_id={user_id} после {MAX_RETRIES} попыток, возвращаем False")
     return False
 
 async def set_user_premium(user_id: int, is_premium: bool, premium_until: Optional[datetime] = None) -> None:
@@ -694,31 +733,62 @@ async def track_user_interaction(user_id: int) -> None:
     """
     now = datetime.now(timezone.utc)
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Проверяем, есть ли уже запись
-        async with db.execute(
-            "SELECT user_id FROM bot_users WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            existing = await cursor.fetchone()
+    # Используем retry логику для подключения
+    for attempt in range(MAX_RETRIES):
+        db = None
+        try:
+            db = await _db_connect_with_retry()
             
-            if existing:
-                # Обновляем последнее взаимодействие
-                await db.execute("""
-                    UPDATE bot_users
-                    SET last_seen_at = ?,
-                        total_interactions = total_interactions + 1
-                    WHERE user_id = ?
-                """, (now.isoformat(), user_id))
+            # Проверяем, есть ли уже запись
+            async with db.execute(
+                "SELECT user_id FROM bot_users WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                existing = await cursor.fetchone()
+                
+                if existing:
+                    # Обновляем последнее взаимодействие
+                    await db.execute("""
+                        UPDATE bot_users
+                        SET last_seen_at = ?,
+                            total_interactions = total_interactions + 1
+                        WHERE user_id = ?
+                    """, (now.isoformat(), user_id))
+                else:
+                    # Создаем новую запись
+                    await db.execute("""
+                        INSERT INTO bot_users
+                        (user_id, first_seen_at, last_seen_at, total_interactions)
+                        VALUES (?, ?, ?, 1)
+                    """, (user_id, now.isoformat(), now.isoformat()))
+            
+            await db.commit()
+            await db.close()
+            return
+        except aiosqlite.OperationalError as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)
+                logging.warning(f"⚠️ БД заблокирована при отслеживании взаимодействия для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                await asyncio.sleep(delay)
+                continue
             else:
-                # Создаем новую запись
-                await db.execute("""
-                    INSERT INTO bot_users
-                    (user_id, first_seen_at, last_seen_at, total_interactions)
-                    VALUES (?, ?, ?, 1)
-                """, (user_id, now.isoformat(), now.isoformat()))
-        
-        await db.commit()
+                # Не критично, просто логируем
+                logging.warning(f"⚠️ Ошибка БД при отслеживании взаимодействия для user_id={user_id}: {e}")
+                return
+        except Exception as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            # Не критично, просто логируем
+            logging.warning(f"⚠️ Ошибка при отслеживании взаимодействия для user_id={user_id}: {e}")
+            return
 
 # ---------- Статистика ----------
 async def get_bot_statistics() -> dict:
@@ -919,29 +989,6 @@ async def save_payment(
         except Exception as e:
             import logging
             logging.error(f"❌ Ошибка при сохранении платежа в БД: {e}", exc_info=True)
-            raise
-
-async def _db_connect_with_retry():
-    """
-    Подключиться к БД с повторными попытками при блокировке.
-    """
-    for attempt in range(MAX_RETRIES):
-        try:
-            db = await aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT)
-            # Включаем WAL mode для лучшей производительности и меньших блокировок
-            await db.execute("PRAGMA journal_mode=WAL")
-            await db.commit()
-            return db
-        except aiosqlite.OperationalError as e:
-            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
-                delay = RETRY_DELAY * (2 ** attempt)  # Экспоненциальная задержка
-                logging.warning(f"⚠️ БД заблокирована, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
-                await asyncio.sleep(delay)
-                continue
-            else:
-                raise
-        except Exception as e:
-            logging.error(f"❌ Ошибка подключения к БД: {e}")
             raise
 
 async def complete_payment(

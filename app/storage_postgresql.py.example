@@ -1,0 +1,128 @@
+# app/storage_postgresql.py.example
+# Пример реализации с PostgreSQL вместо SQLite
+# Для использования: переименуйте в storage.py и установите asyncpg
+
+import os
+import asyncpg
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Optional, List
+from app.models import ChildProfile
+
+# ---------- Настройки БД ----------
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/mamahelper")
+DB_POOL = None  # Connection pool
+
+# ---------- Инициализация пула подключений ----------
+async def init_db_pool():
+    """Инициализировать пул подключений к PostgreSQL."""
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=5,
+            max_size=20,
+            command_timeout=30
+        )
+        logging.info("✅ Пул подключений к PostgreSQL инициализирован")
+
+async def close_db_pool():
+    """Закрыть пул подключений."""
+    global DB_POOL
+    if DB_POOL:
+        await DB_POOL.close()
+        DB_POOL = None
+        logging.info("✅ Пул подключений к PostgreSQL закрыт")
+
+# ---------- Инициализация БД ----------
+async def init_db() -> None:
+    """Инициализация БД: создание таблиц при первом запуске."""
+    await init_db_pool()
+    
+    async with DB_POOL.acquire() as conn:
+        # Таблица профилей детей
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS child_profiles (
+                profile_id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                child_name TEXT,
+                child_age_months INTEGER,
+                child_weight_kg REAL,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                updated_at TIMESTAMP WITH TIME ZONE NOT NULL
+            )
+        """)
+        
+        # Таблица премиум-подписок
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_premium (
+                user_id BIGINT PRIMARY KEY,
+                is_premium BOOLEAN NOT NULL DEFAULT FALSE,
+                premium_until TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                updated_at TIMESTAMP WITH TIME ZONE NOT NULL
+            )
+        """)
+        
+        # Таблица платежей
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                payment_id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount_kopecks INTEGER NOT NULL,
+                subscription_days INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                invoice_payload TEXT NOT NULL,
+                provider_payment_charge_id TEXT,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                completed_at TIMESTAMP WITH TIME ZONE
+            )
+        """)
+        
+        # Индексы для производительности
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_child_profiles_user_id ON child_profiles(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_premium_premium_until ON user_premium(premium_until)")
+        
+        logging.info("✅ Таблицы PostgreSQL созданы/проверены")
+
+# ---------- Пример функции с PostgreSQL ----------
+async def is_user_premium(user_id: int) -> bool:
+    """Проверить, есть ли у пользователя активная премиум-подписка."""
+    await init_db_pool()
+    
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT is_premium, premium_until 
+            FROM user_premium 
+            WHERE user_id = $1
+        """, user_id)
+        
+        if not row:
+            return False
+        
+        is_premium = row['is_premium']
+        premium_until = row['premium_until']
+        
+        # Проверяем, не истекла ли подписка
+        if premium_until and premium_until < datetime.now(timezone.utc):
+            if is_premium:
+                # Обновляем статус
+                await conn.execute("""
+                    UPDATE user_premium 
+                    SET is_premium = FALSE, updated_at = $1 
+                    WHERE user_id = $2
+                """, datetime.now(timezone.utc), user_id)
+            return False
+        
+        return bool(is_premium)
+
+# Преимущества PostgreSQL:
+# - Нет проблем с блокировками
+# - Connection pooling из коробки
+# - Лучшая производительность
+# - Поддержка транзакций
+# - Масштабируемость
+
