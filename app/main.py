@@ -913,10 +913,10 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 bot_info = await context.bot.get_me()
                 bot_username = bot_info.username if bot_info else None
                 
-                # Получаем номер телефона пользователя, если доступен
+                # Номер телефона пользователя недоступен через User объект в Telegram Bot API
+                # ЮKassa автоматически запросит email на странице оплаты для формирования чека
                 customer_phone = None
-                if query.from_user.phone_number:
-                    customer_phone = query.from_user.phone_number
+                customer_email = None
                 
                 payment_result = await create_payment(
                     user_id=user_id,
@@ -925,7 +925,8 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                     subscription_type=subscription_type,
                     subscription_days=subscription_days,
                     bot_username=bot_username,
-                    customer_phone=customer_phone
+                    customer_phone=customer_phone,
+                    customer_email=customer_email
                 )
                 
                 if payment_result:
@@ -1044,10 +1045,10 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 bot_info = await context.bot.get_me()
                 bot_username = bot_info.username if bot_info else None
                 
-                # Получаем номер телефона пользователя, если доступен
+                # Номер телефона пользователя недоступен через User объект в Telegram Bot API
+                # ЮKassa автоматически запросит email на странице оплаты для формирования чека
                 customer_phone = None
-                if query.from_user.phone_number:
-                    customer_phone = query.from_user.phone_number
+                customer_email = None
                 
                 payment_result = await create_payment(
                     user_id=user_id,
@@ -1056,7 +1057,8 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                     subscription_type=subscription_type,
                     subscription_days=subscription_days,
                     bot_username=bot_username,
-                    customer_phone=customer_phone
+                    customer_phone=customer_phone,
+                    customer_email=customer_email
                 )
                 
                 if payment_result:
