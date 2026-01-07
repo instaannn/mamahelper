@@ -90,40 +90,32 @@ else:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start с новым приветственным сценарием."""
-    if not update.message:
-        logging.warning("Received /start command but update.message is None")
-        return
-    
-    logging.info(f"Received /start command from user {update.effective_user.id}")
-    
-    # Показываем индикатор печати и отправляем сообщение о загрузке
-    loading_message = None
-    
-    # Показываем индикатор печати
     try:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action=ChatAction.TYPING
-        )
-    except Exception:
-        pass  # Не критично, продолжаем работу
-    
-    # Отправляем сообщение о загрузке (с таймаутом, чтобы не блокировать)
-    try:
-        loading_message = await asyncio.wait_for(
-            update.message.reply_text("⏳ Загрузка..."),
-            timeout=3.0
-        )
-    except (asyncio.TimeoutError, Exception) as load_error:
-        logging.debug(f"Не удалось отправить сообщение о загрузке: {load_error}")
-        loading_message = None
-    
-    try:
+        if not update.message:
+            logging.warning("Received /start command but update.message is None")
+            return
+        
+        user_id = update.effective_user.id if update.effective_user else "unknown"
+        logging.info(f"🚀 [START] Начало обработки команды /start для user {user_id}")
+        
+        # Показываем индикатор печати (не блокируем при ошибке)
+        try:
+            logging.debug(f"📝 [START] Показываем индикатор печати для user {user_id}")
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id,
+                action=ChatAction.TYPING
+            )
+            logging.debug(f"✅ [START] Индикатор печати показан для user {user_id}")
+        except Exception as action_error:
+            logging.warning(f"⚠️ [START] Не удалось показать индикатор печати для user {user_id}: {action_error}")
+            # Не критично, продолжаем работу
+        
         user = update.effective_user
         # Используем имя профиля (first_name), если нет - username, если нет - "друг"
         user_name = user.first_name or user.username or "друг"
         
         # Оптимизация: выполняем критичные проверки параллельно, track_user_interaction - асинхронно
+        logging.debug(f"📝 [START] Запускаем параллельные проверки для user {user_id}")
         from app.storage import has_dose_events
         
         # Запускаем критичные проверки параллельно (без track_user_interaction для ускорения)
@@ -132,12 +124,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         premium_task = asyncio.create_task(is_premium_user(user.id))
         
         # Ждем результаты критичных проверок
+        logging.debug(f"⏳ [START] Ожидаем результаты проверок для user {user_id}")
         profile, has_events, is_premium = await asyncio.gather(
             profile_task,
             events_task,
             premium_task,
             return_exceptions=True
         )
+        logging.debug(f"✅ [START] Получены результаты проверок для user {user_id}")
         
         # Обрабатываем исключения
         if isinstance(profile, Exception):
@@ -266,13 +260,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Для других ошибок пробрасываем дальше
                 raise
     except Exception as e:
-        # Удаляем сообщение о загрузке при ошибке (если было отправлено)
-        if loading_message:
-            try:
-                await loading_message.delete()
-            except Exception:
-                pass  # Не критично
-        
         # Детальное логирование ошибки
         import traceback
         error_details = traceback.format_exc()
