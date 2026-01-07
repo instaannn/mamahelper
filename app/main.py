@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta, time as dt_time
 
-from telegram import Update, LabeledPrice
+from telegram import Update, LabeledPrice, ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters, PreCheckoutQueryHandler
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -95,27 +95,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     logging.info(f"Received /start command from user {update.effective_user.id}")
+    
+    # Показываем индикатор печати и отправляем временное сообщение о загрузке
+    loading_message = None
+    try:
+        # Показываем индикатор печати
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING
+        )
+        
+        # Отправляем видимое сообщение о загрузке
+        loading_message = await update.message.reply_text("⏳ Загрузка...")
+    except Exception as action_error:
+        # Не критично, продолжаем работу
+        logging.debug(f"Не удалось показать индикатор загрузки: {action_error}")
+    
     try:
         user = update.effective_user
         # Используем имя профиля (first_name), если нет - username, если нет - "друг"
         user_name = user.first_name or user.username or "друг"
         
-        # Оптимизация: выполняем все проверки параллельно для ускорения
+        # Оптимизация: выполняем критичные проверки параллельно, track_user_interaction - асинхронно
         import asyncio
         from app.storage import has_dose_events
         
-        # Запускаем все проверки параллельно
+        # Запускаем критичные проверки параллельно (без track_user_interaction для ускорения)
         profile_task = asyncio.create_task(get_child_profile(user.id))
         events_task = asyncio.create_task(has_dose_events(user.id))
         premium_task = asyncio.create_task(is_premium_user(user.id))
-        track_task = asyncio.create_task(track_user_interaction(user.id))
         
-        # Ждем результаты
-        profile, has_events, is_premium, _ = await asyncio.gather(
+        # Ждем результаты критичных проверок
+        profile, has_events, is_premium = await asyncio.gather(
             profile_task,
             events_task,
             premium_task,
-            track_task,
             return_exceptions=True
         )
         
@@ -129,6 +143,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if isinstance(is_premium, Exception):
             logging.warning(f"⚠️ Ошибка при проверке премиума для user {user.id}: {is_premium}")
             is_premium = False
+        
+        # Отслеживание взаимодействия запускаем в фоне (не блокируем ответ)
+        asyncio.create_task(track_user_interaction(user.id))
         
         has_profile = profile is not None
         if has_profile:
@@ -220,6 +237,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        # Удаляем временное сообщение о загрузке, если оно было отправлено
+        if loading_message:
+            try:
+                await loading_message.delete()
+            except Exception as delete_error:
+                # Не критично, продолжаем
+                logging.debug(f"Не удалось удалить сообщение о загрузке: {delete_error}")
+        
         # Для первого визита используем Markdown для форматирования
         try:
             if is_first_visit:
@@ -236,6 +261,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Для других ошибок пробрасываем дальше
                 raise
     except Exception as e:
+        # Удаляем временное сообщение о загрузке при ошибке
+        if loading_message:
+            try:
+                await loading_message.delete()
+            except Exception:
+                pass  # Не критично
+        
         # Детальное логирование ошибки
         import traceback
         error_details = traceback.format_exc()
@@ -1354,36 +1386,60 @@ async def post_init(application: Application) -> None:
     for attempt in range(max_attempts):
         try:
             # Сначала проверяем, есть ли активный webhook
-            webhook_info = await application.bot.get_webhook_info()
+            try:
+                webhook_info = await asyncio.wait_for(
+                    application.bot.get_webhook_info(),
+                    timeout=5.0
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                logging.warning(f"⚠️ Таймаут/ошибка при проверке webhook (попытка {attempt + 1}/{max_attempts}): {e}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    logging.warning("⚠️ Пропускаем очистку webhook из-за таймаутов, продолжаем запуск")
+                    break
+            
             if webhook_info.url:
                 logging.warning(f"⚠️ Обнаружен активный webhook: {webhook_info.url}")
                 logging.warning("⚠️ Это может вызывать конфликты с polling!")
             
             # Удаляем webhook с очисткой pending updates
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            logging.info("✅ Webhook очищен, pending updates удалены")
-            
-            # Увеличенная задержка для обработки на стороне Telegram
-            # Это важно, чтобы Telegram успел закрыть старое соединение
-            await asyncio.sleep(2)
-            
-            # Проверяем еще раз после удаления
-            webhook_info = await application.bot.get_webhook_info()
-            if not webhook_info.url:
-                logging.info("✅ Webhook успешно удален")
+            try:
+                await asyncio.wait_for(
+                    application.bot.delete_webhook(drop_pending_updates=True),
+                    timeout=5.0
+                )
+                logging.info("✅ Webhook очищен, pending updates удалены")
+            except asyncio.TimeoutError:
+                logging.warning("⚠️ Таймаут при удалении webhook, но продолжаем запуск")
                 break
-            else:
-                if attempt < max_attempts - 1:
-                    logging.warning(f"⚠️ Webhook все еще активен, попытка {attempt + 1}/{max_attempts}...")
-                    await asyncio.sleep(1)
-                else:
-                    logging.error(f"❌ Не удалось удалить webhook после {max_attempts} попыток! URL: {webhook_info.url}")
+            except Exception as e:
+                logging.warning(f"⚠️ Ошибка при удалении webhook: {e}, но продолжаем запуск")
+                break
+            
+            # Небольшая задержка для обработки на стороне Telegram
+            await asyncio.sleep(1)
+            
+            # Проверяем еще раз после удаления (не критично)
+            try:
+                webhook_info = await asyncio.wait_for(
+                    application.bot.get_webhook_info(),
+                    timeout=3.0
+                )
+                if not webhook_info.url:
+                    logging.info("✅ Webhook успешно удален")
+                    break
+            except:
+                # Не критично, продолжаем
+                break
         except Exception as e:
             if attempt < max_attempts - 1:
                 logging.warning(f"⚠️ Ошибка при очистке webhook (попытка {attempt + 1}/{max_attempts}): {e}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
             else:
-                logging.error(f"❌ Ошибка при очистке webhook после {max_attempts} попыток: {e}", exc_info=True)
+                logging.warning(f"⚠️ Не удалось полностью очистить webhook после {max_attempts} попыток, но продолжаем запуск: {e}")
+                # Не прерываем запуск - продолжаем работу
     
     # Дополнительная задержка после очистки webhook, чтобы Telegram успел закрыть все соединения
     # Это критично для предотвращения ошибок 409 Conflict
