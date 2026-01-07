@@ -237,13 +237,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Удаляем сообщение о загрузке, если оно было отправлено
-        if loading_message:
-            try:
-                await loading_message.delete()
-            except Exception:
-                pass  # Не критично
-        
         # Для первого визита используем Markdown для форматирования
         try:
             if is_first_visit:
