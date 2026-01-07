@@ -76,23 +76,39 @@ async def create_payment(
         return None
     
     try:
+        # Проверяем режим работы (тестовый/боевой)
+        is_test_mode = "test" in YOOKASSA_SECRET_KEY.lower() or "test" in YOOKASSA_SHOP_ID.lower()
+        if is_test_mode:
+            logging.warning(f"⚠️ Создание платежа в ТЕСТОВОМ режиме. СБП недоступен в тестовом режиме!")
+        else:
+            logging.info(f"✅ Создание платежа в БОЕВОМ режиме. СБП должен быть доступен.")
+        
         # Создаем уникальный idempotence_key для предотвращения дублирования платежей
         idempotence_key = str(uuid.uuid4())
         
         # Формируем payload для идентификации платежа
         payload = f"premium_{subscription_type}_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
         
+        # Формируем return_url
+        final_return_url = return_url
+        if not final_return_url and bot_username:
+            final_return_url = f"https://t.me/{bot_username}?start=payment_success"
+        elif not final_return_url:
+            final_return_url = "https://t.me"
+        
+        logging.info(f"🔗 Return URL для платежа: {final_return_url}")
+        
         # Создаем платеж
         # Если не указывать payment_method_data, на странице оплаты будут доступны
         # все способы оплаты, активированные в личном кабинете ЮKassa (карты, СБП и др.)
-        payment = Payment.create({
+        payment_data = {
             "amount": {
                 "value": f"{amount:.2f}",
                 "currency": "RUB"
             },
             "confirmation": {
                 "type": "redirect",
-                "return_url": return_url or (f"https://t.me/{bot_username}?start=payment_success" if bot_username else "https://t.me")
+                "return_url": final_return_url
             },
             "capture": True,  # Автоматическое списание средств
             "description": description,
@@ -102,16 +118,39 @@ async def create_payment(
                 "subscription_days": str(subscription_days),
                 "payload": payload
             }
-        }, idempotence_key)
+        }
+        
+        logging.info(f"📋 Данные платежа: amount={amount} RUB, description={description}")
+        logging.info(f"💡 Примечание: payment_method_data не указан - будут доступны все способы оплаты из личного кабинета ЮKassa")
+        
+        payment = Payment.create(payment_data, idempotence_key)
         
         payment_id = payment.id
         confirmation_url = payment.confirmation.confirmation_url
         status = payment.status
         
+        # Логируем информацию о доступных способах оплаты (если доступно)
+        try:
+            if hasattr(payment, 'payment_method') and payment.payment_method:
+                logging.info(f"💳 Способ оплаты платежа: {payment.payment_method}")
+            if hasattr(payment, 'available_payment_methods') and payment.available_payment_methods:
+                logging.info(f"💳 Доступные способы оплаты: {payment.available_payment_methods}")
+        except Exception as log_error:
+            logging.debug(f"Не удалось получить информацию о способах оплаты: {log_error}")
+        
         logging.info(
             f"✅ Платеж создан: payment_id={payment_id}, "
             f"user_id={user_id}, amount={amount}, status={status}"
         )
+        logging.info(f"🔗 URL для оплаты: {confirmation_url}")
+        
+        # Дополнительное предупреждение, если используется тестовый режим
+        if is_test_mode:
+            logging.warning(
+                f"⚠️ ВНИМАНИЕ: Платеж создан в ТЕСТОВОМ режиме! "
+                f"СБП недоступен в тестовом режиме. "
+                f"Для работы СБП используйте боевые ключи ЮKassa."
+            )
         
         return {
             "payment_id": payment_id,
