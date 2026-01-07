@@ -1021,7 +1021,7 @@ async def complete_payment(
                 FROM payments
                 WHERE invoice_payload = ? AND status = 'pending'
             """, (invoice_payload,)) as cursor:
-            row = await cursor.fetchone()
+                row = await cursor.fetchone()
             
             # Если не нашли pending, проверяем, может быть платеж уже обработан
             if not row:
@@ -1076,30 +1076,27 @@ async def complete_payment(
                             else:
                                 logging.error(f"❌ Не удалось определить тип подписки из payload: {invoice_payload}")
                                 return None
-                                
-                                # Создаем запись о платеже вручную
-                                logging.warning(f"⚠️ Создаем запись о платеже вручную для user_id={user_id}")
-                                await db.execute("""
-                                    INSERT INTO payments
-                                    (user_id, invoice_payload, amount, currency, subscription_type, subscription_days, status, created_at, completed_at, provider_payment_charge_id)
-                                    VALUES (?, ?, ?, 'RUB', ?, ?, 'completed', ?, ?, ?)
-                                """, (
-                                    user_id,
-                                    invoice_payload,
-                                    amount * 100,  # в копейках
-                                    '1month' if subscription_days == 30 else '3months',
-                                    subscription_days,
-                                    now.isoformat(),
-                                    now.isoformat(),
-                                    provider_payment_charge_id
-                                ))
-                                await db.commit()
-                                
-                                # Продолжаем обработку
-                                row = {"user_id": user_id, "subscription_days": subscription_days, "status": "completed"}
-                            else:
-                                logging.error(f"❌ Неверный формат payload: {invoice_payload}")
-                                return None
+                            
+                            # Создаем запись о платеже вручную
+                            logging.warning(f"⚠️ Создаем запись о платеже вручную для user_id={user_id}")
+                            await db.execute("""
+                                INSERT INTO payments
+                                (user_id, invoice_payload, amount, currency, subscription_type, subscription_days, status, created_at, completed_at, provider_payment_charge_id)
+                                VALUES (?, ?, ?, 'RUB', ?, ?, 'completed', ?, ?, ?)
+                            """, (
+                                user_id,
+                                invoice_payload,
+                                amount * 100,  # в копейках
+                                '1month' if subscription_days == 30 else '3months',
+                                subscription_days,
+                                now.isoformat(),
+                                now.isoformat(),
+                                provider_payment_charge_id
+                            ))
+                            await db.commit()
+                            
+                            # Продолжаем обработку
+                            row = {"user_id": user_id, "subscription_days": subscription_days, "status": "completed"}
                         except (ValueError, IndexError) as e:
                             logging.error(f"❌ Ошибка при извлечении данных из payload '{invoice_payload}': {e}")
                             return None
@@ -1110,33 +1107,34 @@ async def complete_payment(
             user_id = row["user_id"]
             subscription_days = row["subscription_days"]
             
-                # Обновляем статус платежа
-                await db.execute("""
-                    UPDATE payments
-                    SET status = 'completed',
-                        provider_payment_charge_id = ?,
-                        completed_at = ?
-                    WHERE invoice_payload = ?
-                """, (provider_payment_charge_id, now.isoformat(), invoice_payload))
-                
-                # Активируем премиум-подписку
-                # Получаем текущую дату окончания премиума (если есть)
-                async with db.execute("""
-                    SELECT premium_until FROM user_premium WHERE user_id = ?
-                """, (user_id,)) as cursor2:
-                    existing_row = await cursor2.fetchone()
-                    if existing_row and existing_row["premium_until"]:
-                        # Если подписка уже есть, продлеваем её
-                        current_until = datetime.fromisoformat(existing_row["premium_until"])
-                        if current_until > now:
-                            # Подписка еще активна - продлеваем от текущей даты окончания
-                            new_until = current_until + timedelta(days=subscription_days)
-                        else:
-                            # Подписка истекла - начинаем с сегодня
-                            new_until = now + timedelta(days=subscription_days)
-                    else:
-                        # Нет активной подписки - начинаем с сегодня
-                        new_until = now + timedelta(days=subscription_days)
+            # Обновляем статус платежа
+            await db.execute("""
+                UPDATE payments
+                SET status = 'completed',
+                    provider_payment_charge_id = ?,
+                    completed_at = ?
+                WHERE invoice_payload = ?
+            """, (provider_payment_charge_id, now.isoformat(), invoice_payload))
+            
+            # Активируем премиум-подписку
+            # Получаем текущую дату окончания премиума (если есть)
+            async with db.execute("""
+                SELECT premium_until FROM user_premium WHERE user_id = ?
+            """, (user_id,)) as cursor2:
+                existing_row = await cursor2.fetchone()
+            
+            if existing_row and existing_row["premium_until"]:
+                # Если подписка уже есть, продлеваем её
+                current_until = datetime.fromisoformat(existing_row["premium_until"])
+                if current_until > now:
+                    # Подписка еще активна - продлеваем от текущей даты окончания
+                    new_until = current_until + timedelta(days=subscription_days)
+                else:
+                    # Подписка истекла - начинаем с сегодня
+                    new_until = now + timedelta(days=subscription_days)
+            else:
+                # Нет активной подписки - начинаем с сегодня
+                new_until = now + timedelta(days=subscription_days)
                 
             # Устанавливаем премиум-статус (эта функция сама управляет подключением)
             await set_user_premium(user_id, True, new_until)
@@ -1177,21 +1175,6 @@ async def complete_payment(
     # Если все попытки исчерпаны
     logging.error(f"❌ Не удалось обработать платеж '{invoice_payload}' после {MAX_RETRIES} попыток")
     return None
-            except aiosqlite.OperationalError as e:
-                if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
-                    delay = RETRY_DELAY * (2 ** attempt)
-                    logging.warning(f"⚠️ БД заблокирована при обработке платежа, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    logging.error(f"❌ Ошибка БД при обработке платежа: {e}")
-                    raise
-            except Exception as e:
-                logging.error(f"❌ Неожиданная ошибка при обработке платежа: {e}", exc_info=True)
-                raise
-        finally:
-            if db:
-                await db.close()
 
 # ---------- Уведомления о истечении премиума ----------
 async def get_users_with_expiring_premium(min_days: int = 3, max_days: int = 5) -> List[tuple]:
