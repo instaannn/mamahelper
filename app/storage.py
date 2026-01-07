@@ -65,20 +65,24 @@ async def save_dose_event(user_id: int, drug_key: str, dose_mg: float, metadata:
 
 async def _prune_older_than_24h(user_id: int, drug: str) -> None:
     """Удалить записи старше 24 часов из БД."""
-    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        if drug:
-            await db.execute("""
-                DELETE FROM dose_events 
-                WHERE user_id = ? AND drug_key = ? AND created_at < ?
-            """, (user_id, drug, cutoff_time.isoformat()))
-        else:
-            await db.execute("""
-                DELETE FROM dose_events 
-                WHERE user_id = ? AND created_at < ?
-            """, (user_id, cutoff_time.isoformat()))
-        await db.commit()
+    try:
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+        
+        async with await _get_db_connection() as db:
+            if drug:
+                await db.execute("""
+                    DELETE FROM dose_events 
+                    WHERE user_id = ? AND drug_key = ? AND created_at < ?
+                """, (user_id, drug, cutoff_time.isoformat()))
+            else:
+                await db.execute("""
+                    DELETE FROM dose_events 
+                    WHERE user_id = ? AND created_at < ?
+                """, (user_id, cutoff_time.isoformat()))
+            await db.commit()
+    except Exception as e:
+        logging.warning(f"⚠️ Ошибка при очистке старых записей для user_id={user_id}: {e}")
+        # Не критично, продолжаем работу
 
 async def get_daily_total_mg(user_id: int, drug: str, child_name: str = None) -> float:
     """Получить суточную дозу за последние 24 часа из БД.
@@ -189,10 +193,9 @@ async def get_all_dose_events(user_id: int, drug_key: str = None):
 async def has_dose_events(user_id: int) -> bool:
     """Проверить, есть ли записи в дневнике за последние 24 часа в БД."""
     try:
-        await _prune_older_than_24h(user_id, "")
-        
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
         
+        # Используем одно подключение для проверки
         async with await _get_db_connection() as db:
             async with db.execute("""
                 SELECT COUNT(*) as count
@@ -200,7 +203,8 @@ async def has_dose_events(user_id: int) -> bool:
                 WHERE user_id = ? AND created_at >= ?
             """, (user_id, cutoff_time.isoformat())) as cursor:
                 row = await cursor.fetchone()
-                return bool(row[0] and row[0] > 0)
+                count = row[0] if row else 0
+                return bool(count and count > 0)
     except Exception as e:
         logging.warning(f"⚠️ Ошибка при проверке наличия записей для user_id={user_id}: {e}")
         return False
@@ -628,6 +632,14 @@ async def is_user_premium(user_id: int) -> bool:
                     await db.close()
                 except:
                     pass
+            error_msg = str(e).lower()
+            # Обрабатываем различные типы ошибок
+            if "connection closed" in error_msg or "closed" in error_msg:
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAY * (2 ** attempt)
+                    logging.warning(f"⚠️ Соединение закрыто при проверке премиума для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                    await asyncio.sleep(delay)
+                    continue
             # В случае любой ошибки считаем, что премиум нет (безопасный вариант)
             logging.warning(f"⚠️ Ошибка при проверке премиума для user_id={user_id}: {e}, возвращаем False")
             return False
