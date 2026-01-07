@@ -153,16 +153,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             logging.info(f"User {user.id} has no profile")
         
-        # Если нет профиля и нет записей - это первый визит
-        # Но если премиум-статус True, возможно остались старые данные - сбрасываем
-        is_first_visit = not has_profile and not has_events
-        if is_first_visit and is_premium:
-            # Если это первый визит, но премиум-статус True - это странно, логируем и сбрасываем
-            logging.warning(f"⚠️ User {user.id} - First visit but premium status is True! This might be stale data.")
-            logging.warning(f"⚠️ Resetting premium status for new user.")
-            from app.storage import set_user_premium
-            await set_user_premium(user.id, False)
-            is_premium = False
+        # Определяем, первый ли это визит
+        # Если у пользователя есть активный премиум - это точно не первый визит (он уже использовал бота)
+        if is_premium:
+            is_first_visit = False
+            logging.debug(f"User {user.id} имеет активный премиум - это не первый визит")
+        else:
+            # Если нет профиля и нет записей - это первый визит
+            is_first_visit = not has_profile and not has_events
+            
+            # Дополнительно проверяем таблицу bot_users для точности
+            from app.storage import DB_PATH
+            import aiosqlite
+            try:
+                async with aiosqlite.connect(DB_PATH, timeout=5.0) as check_db:
+                    async with check_db.execute(
+                        "SELECT first_seen_at FROM bot_users WHERE user_id = ?",
+                        (user.id,)
+                    ) as cursor:
+                        user_record = await cursor.fetchone()
+                        if user_record:
+                            # Пользователь уже был в боте ранее - это не первый визит
+                            is_first_visit = False
+                            logging.debug(f"User {user.id} уже был в боте ранее (first_seen_at: {user_record[0]})")
+            except Exception as check_error:
+                # Если не удалось проверить - используем текущую логику
+                logging.debug(f"Не удалось проверить историю пользователя {user.id}: {check_error}")
         
         logging.info(f"User {user.id} ({user_name}) - Bot Premium status: {is_premium}, First visit: {is_first_visit}")
         
@@ -320,8 +336,8 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # Создаем кнопки для покупки премиум
         premium_keyboard = [
-            [InlineKeyboardButton("🌟 1 месяц - 99₽", callback_data="premium_buy_1month")],
-            [InlineKeyboardButton("🌟 3 месяца - 270₽", callback_data="premium_buy_3months")],
+            [InlineKeyboardButton("🌟 1 месяц - 5₽ (тест)", callback_data="premium_buy_1month")],
+            [InlineKeyboardButton("🌟 3 месяца - 15₽ (тест)", callback_data="premium_buy_3months")],
             [InlineKeyboardButton("❤️ Поддержать проект", callback_data="premium_support")],
             [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
         ]
@@ -884,9 +900,9 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
     user_id = query.from_user.id
     
     if query.data == "premium_buy_1month":
-        # Премиум на 1 месяц - 99₽
+        # Премиум на 1 месяц - 5₽ (тест)
         payload = f"premium_1month_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
-        prices = [LabeledPrice("Премиум-подписка на 1 месяц", 99 * 100)]  # 99₽ в копейках
+        prices = [LabeledPrice("Премиум-подписка на 1 месяц", 5 * 100)]  # 5₽ в копейках (тест)
         
         try:
             await query.message.reply_invoice(
@@ -909,7 +925,7 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
             )
             # Сохраняем информацию о платеже в БД (amount в копейках)
             try:
-                await save_payment(user_id, payload, 99 * 100, "RUB", "1month", 30)
+                await save_payment(user_id, payload, 5 * 100, "RUB", "1month", 30)  # 5₽ для теста
                 logging.info(f"✅ Платеж сохранен в БД: user_id={user_id}, payload={payload}")
             except Exception as save_error:
                 logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
@@ -936,9 +952,9 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 logging.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
     
     elif query.data == "premium_buy_3months":
-        # Премиум на 3 месяца - 270₽
+        # Премиум на 3 месяца - 15₽ (тест)
         payload = f"premium_3months_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
-        prices = [LabeledPrice("Премиум-подписка на 3 месяца", 270 * 100)]  # 270₽ в копейках
+        prices = [LabeledPrice("Премиум-подписка на 3 месяца", 15 * 100)]  # 15₽ в копейках (тест)
         
         try:
             await query.message.reply_invoice(
@@ -962,7 +978,7 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
             )
             # Сохраняем информацию о платеже в БД (amount в копейках) - не блокируем при ошибке
             try:
-                await save_payment(user_id, payload, 270 * 100, "RUB", "3months", 90)
+                await save_payment(user_id, payload, 15 * 100, "RUB", "3months", 90)  # 15₽ для теста
                 logging.info(f"✅ Платеж сохранен в БД: user_id={user_id}, payload={payload}")
             except Exception as save_error:
                 logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
@@ -1249,8 +1265,8 @@ async def send_premium_expiry_notification(context: ContextTypes.DEFAULT_TYPE, u
         
         # Создаем кнопки для продления
         premium_keyboard = [
-            [InlineKeyboardButton("🌟 1 месяц - 99₽", callback_data="premium_buy_1month")],
-            [InlineKeyboardButton("🌟 3 месяца - 270₽", callback_data="premium_buy_3months")],
+            [InlineKeyboardButton("🌟 1 месяц - 5₽ (тест)", callback_data="premium_buy_1month")],
+            [InlineKeyboardButton("🌟 3 месяца - 15₽ (тест)", callback_data="premium_buy_3months")],
             [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
         ]
         premium_markup = InlineKeyboardMarkup(premium_keyboard)
@@ -1288,8 +1304,8 @@ async def send_premium_expired_notification(context: ContextTypes.DEFAULT_TYPE, 
         
         # Создаем кнопки для продления
         premium_keyboard = [
-            [InlineKeyboardButton("🌟 1 месяц - 99₽", callback_data="premium_buy_1month")],
-            [InlineKeyboardButton("🌟 3 месяца - 270₽", callback_data="premium_buy_3months")],
+            [InlineKeyboardButton("🌟 1 месяц - 5₽ (тест)", callback_data="premium_buy_1month")],
+            [InlineKeyboardButton("🌟 3 месяца - 15₽ (тест)", callback_data="premium_buy_3months")],
             [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
         ]
         premium_markup = InlineKeyboardMarkup(premium_keyboard)
@@ -1599,6 +1615,7 @@ def main():
                     
                     await update.message.reply_text(success_text, parse_mode="Markdown")
                     logging.info(f"✅ Премиум активирован для пользователя {user_id} до {until_str}")
+                    return  # Успешно обработано, выходим из функции
                 else:
                     # Платеж не найден - это критическая ошибка
                     error_msg = (
@@ -1620,6 +1637,7 @@ def main():
                         f"Total Amount: {payment.total_amount}\n"
                         f"Currency: {payment.currency}"
                     )
+                    return  # Ошибка обработана, выходим из функции
             except Exception as e:
                 import traceback
                 error_details = traceback.format_exc()
@@ -1630,19 +1648,19 @@ def main():
                     f"Payload: {payment.invoice_payload if 'payment' in locals() else 'unknown'}",
                     exc_info=True
                 )
-            # Формируем сообщение об ошибке без Markdown, чтобы избежать ошибок парсинга
-            error_msg = (
-                f"❌ Произошла ошибка при активации премиума.\n\n"
-                f"Не волнуйтесь! Ваши деньги в безопасности.\n\n"
-                f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
-                f"• Ваш user_id: {user_id if 'user_id' in locals() else 'неизвестен'}\n"
-                f"• Payload: {payment.invoice_payload if 'payment' in locals() else 'неизвестен'}\n\n"
-                f"Мы активируем премиум вручную."
-            )
-            try:
-                await update.message.reply_text(error_msg)
-            except Exception as send_error:
-                logging.error(f"❌ Не удалось отправить сообщение об ошибке пользователю: {send_error}")
+                # Формируем сообщение об ошибке без Markdown, чтобы избежать ошибок парсинга
+                error_msg = (
+                    f"❌ Произошла ошибка при активации премиума.\n\n"
+                    f"Не волнуйтесь! Ваши деньги в безопасности.\n\n"
+                    f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
+                    f"• Ваш user_id: {user_id if 'user_id' in locals() else 'неизвестен'}\n"
+                    f"• Payload: {payment.invoice_payload if 'payment' in locals() else 'неизвестен'}\n\n"
+                    f"Мы активируем премиум вручную."
+                )
+                try:
+                    await update.message.reply_text(error_msg)
+                except Exception as send_error:
+                    logging.error(f"❌ Не удалось отправить сообщение об ошибке пользователю: {send_error}")
         
         application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
         application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))

@@ -1062,10 +1062,10 @@ async def complete_payment(
                             # Определяем тип подписки из payload
                             if '1month' in invoice_payload:
                                 subscription_days = 30
-                                amount = 99
+                                amount = 5  # 5₽ для теста
                             elif '3months' in invoice_payload:
                                 subscription_days = 90
-                                amount = 270
+                                amount = 15  # 15₽ для теста
                             else:
                                 logging.error(f"❌ Не удалось определить тип подписки из payload: {invoice_payload}")
                                 return None
@@ -1188,14 +1188,20 @@ async def complete_payment(
                     logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Запись о премиум не найдена после сохранения для user_id={user_id}!")
                     raise ValueError(f"Запись о премиум не найдена после сохранения для user_id={user_id}")
             
-            # Закрываем соединение перед возвратом
-            await db.close()
-            
-            return {
+            # Возвращаем результат (db закроется автоматически через async with)
+            result = {
                 "user_id": user_id,
                 "subscription_days": subscription_days,
                 "premium_until": new_until
             }
+            
+            # Закрываем соединение явно перед возвратом (на случай если async with не сработает)
+            try:
+                await db.close()
+            except Exception:
+                pass  # Не критично, если уже закрыто
+            
+            return result
         except aiosqlite.OperationalError as e:
             if db:
                 try:
