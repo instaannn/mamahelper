@@ -5,6 +5,7 @@ import sys
 import subprocess
 import time
 import asyncio
+from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta, time as dt_time
 
@@ -30,10 +31,37 @@ from app.utils import is_premium_user
 # Загружаем переменные окружения из .env файла
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+# Настройка логирования с записью в файл
+LOG_DIR = Path(__file__).resolve().parent / "data"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / "bot.log"
+
+# Создаем форматтер
+formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
+
+# Настройка root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Очищаем существующие обработчики
+root_logger.handlers.clear()
+
+# Обработчик для файла
+file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(formatter)
+root_logger.addHandler(file_handler)
+
+# Обработчик для консоли
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+root_logger.addHandler(console_handler)
+
+logging.info(f"📝 Логи записываются в файл: {LOG_FILE}")
 
 # Берём токен из переменных окружения
 API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -189,13 +217,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(welcome_text, reply_markup=reply_markup)
     except Exception as e:
-        logging.error(f"Error in start command: {e}", exc_info=True)
+        # Детальное логирование ошибки
+        import traceback
+        error_details = traceback.format_exc()
+        logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА в команде /start для user {update.effective_user.id}:")
+        logging.error(f"Тип ошибки: {type(e).__name__}")
+        logging.error(f"Сообщение: {str(e)}")
+        logging.error(f"Полный traceback:\n{error_details}")
+        
+        # Пытаемся отправить сообщение пользователю
         try:
             await update.message.reply_text(
-                "Произошла ошибка при обработке команды. Пожалуйста, попробуйте еще раз."
+                "Произошла ошибка при обработке команды. Пожалуйста, попробуйте еще раз.\n\n"
+                f"Ошибка: {type(e).__name__}: {str(e)[:100]}"
             )
-        except:
-            pass
+        except Exception as send_error:
+            logging.error(f"❌ Не удалось отправить сообщение об ошибке пользователю: {send_error}")
 
 async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик inline кнопок из команды /start."""

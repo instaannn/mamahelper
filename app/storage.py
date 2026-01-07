@@ -188,18 +188,22 @@ async def get_all_dose_events(user_id: int, drug_key: str = None):
 
 async def has_dose_events(user_id: int) -> bool:
     """Проверить, есть ли записи в дневнике за последние 24 часа в БД."""
-    await _prune_older_than_24h(user_id, "")
-    
-    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT COUNT(*) as count
-            FROM dose_events
-            WHERE user_id = ? AND created_at >= ?
-        """, (user_id, cutoff_time.isoformat())) as cursor:
-            row = await cursor.fetchone()
-            return bool(row[0] and row[0] > 0)
+    try:
+        await _prune_older_than_24h(user_id, "")
+        
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+        
+        async with await _get_db_connection() as db:
+            async with db.execute("""
+                SELECT COUNT(*) as count
+                FROM dose_events
+                WHERE user_id = ? AND created_at >= ?
+            """, (user_id, cutoff_time.isoformat())) as cursor:
+                row = await cursor.fetchone()
+                return bool(row[0] and row[0] > 0)
+    except Exception as e:
+        logging.warning(f"⚠️ Ошибка при проверке наличия записей для user_id={user_id}: {e}")
+        return False
 
 # ---------- Feedback (JSONL) ----------
 def save_feedback(text: str, meta: dict) -> None:
