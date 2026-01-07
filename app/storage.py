@@ -637,94 +637,87 @@ async def set_user_premium(user_id: int, is_premium: bool, premium_until: Option
     """Установить премиум-статус пользователя."""
     now = datetime.now(timezone.utc)
     
-    # Используем retry логику для подключения
+    # Используем retry логику с простым подключением
     for attempt in range(MAX_RETRIES):
-        db = None
         try:
-            db = await _db_connect_with_retry()
-            db.row_factory = aiosqlite.Row
-            
-            # Проверяем, есть ли уже запись
-            async with db.execute(
-                "SELECT user_id FROM user_premium WHERE user_id = ?",
-                (user_id,)
-            ) as cursor:
-                existing = await cursor.fetchone()
+            async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT) as db:
+                db.row_factory = aiosqlite.Row
                 
-                if existing:
-                    # Обновляем существующую запись
-                    await db.execute("""
-                        UPDATE user_premium
-                        SET is_premium = ?,
-                            premium_until = ?,
-                            updated_at = ?
-                        WHERE user_id = ?
-                    """, (
-                        1 if is_premium else 0,
-                        premium_until.isoformat() if premium_until else None,
-                        now.isoformat(),
-                        user_id,
-                    ))
-                else:
-                    # Создаем новую запись
-                    await db.execute("""
-                        INSERT INTO user_premium
-                        (user_id, is_premium, premium_until, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (
-                        user_id,
-                        1 if is_premium else 0,
-                        premium_until.isoformat() if premium_until else None,
-                        now.isoformat(),
-                        now.isoformat(),
-                    ))
+                # Проверяем, есть ли уже запись
+                async with db.execute(
+                    "SELECT user_id FROM user_premium WHERE user_id = ?",
+                    (user_id,)
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                    
+                    if existing:
+                        # Обновляем существующую запись
+                        await db.execute("""
+                            UPDATE user_premium
+                            SET is_premium = ?,
+                                premium_until = ?,
+                                updated_at = ?
+                            WHERE user_id = ?
+                        """, (
+                            1 if is_premium else 0,
+                            premium_until.isoformat() if premium_until else None,
+                            now.isoformat(),
+                            user_id,
+                        ))
+                    else:
+                        # Создаем новую запись
+                        await db.execute("""
+                            INSERT INTO user_premium
+                            (user_id, is_premium, premium_until, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (
+                            user_id,
+                            1 if is_premium else 0,
+                            premium_until.isoformat() if premium_until else None,
+                            now.isoformat(),
+                            now.isoformat(),
+                        ))
+                
+                await db.commit()
+                
+                # Проверяем, что данные действительно сохранились
+                async with db.execute(
+                    "SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?",
+                    (user_id,)
+                ) as verify_cursor:
+                    verify_row = await verify_cursor.fetchone()
+                    if verify_row:
+                        saved_is_premium = bool(int(verify_row["is_premium"])) if verify_row["is_premium"] is not None else False
+                        saved_premium_until = verify_row["premium_until"]
+                        logging.info(
+                            f"✅ Премиум сохранен для user_id={user_id}: "
+                            f"is_premium={saved_is_premium}, premium_until={saved_premium_until}"
+                        )
+                        if not saved_is_premium and is_premium:
+                            logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не сохранился для user_id={user_id}!")
+                            raise ValueError(f"Премиум не сохранился в БД для user_id={user_id}")
+                    else:
+                        logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Запись не найдена после сохранения для user_id={user_id}!")
+                        raise ValueError(f"Запись не найдена после сохранения для user_id={user_id}")
             
-            await db.commit()
-            
-            # Проверяем, что данные действительно сохранились
-            async with db.execute(
-                "SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?",
-                (user_id,)
-            ) as verify_cursor:
-                verify_row = await verify_cursor.fetchone()
-                if verify_row:
-                    saved_is_premium = bool(int(verify_row["is_premium"])) if verify_row["is_premium"] is not None else False
-                    saved_premium_until = verify_row["premium_until"]
-                    logging.info(
-                        f"✅ Премиум сохранен для user_id={user_id}: "
-                        f"is_premium={saved_is_premium}, premium_until={saved_premium_until}"
-                    )
-                    if not saved_is_premium and is_premium:
-                        logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не сохранился для user_id={user_id}!")
-                        raise ValueError(f"Премиум не сохранился в БД для user_id={user_id}")
-                else:
-                    logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Запись не найдена после сохранения для user_id={user_id}!")
-                    raise ValueError(f"Запись не найдена после сохранения для user_id={user_id}")
-            
-            await db.close()
             return
         except aiosqlite.OperationalError as e:
-            if db:
-                try:
-                    await db.close()
-                except:
-                    pass
-            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+            error_msg = str(e).lower()
+            if ("database is locked" in error_msg or "connection closed" in error_msg) and attempt < MAX_RETRIES - 1:
                 delay = RETRY_DELAY * (2 ** attempt)
-                logging.warning(f"⚠️ БД заблокирована при установке премиума для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                logging.warning(f"⚠️ БД заблокирована/закрыта при установке премиума для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
                 await asyncio.sleep(delay)
                 continue
             else:
                 logging.error(f"❌ Ошибка БД при установке премиума для user_id={user_id}: {e}")
                 raise
         except Exception as e:
-            if db:
-                try:
-                    await db.close()
-                except:
-                    pass
             logging.error(f"❌ Неожиданная ошибка при установке премиума для user_id={user_id}: {e}", exc_info=True)
             raise
+    
+    # Если все попытки исчерпаны
+    logging.error(f"❌ Не удалось установить премиум для user_id={user_id} после {MAX_RETRIES} попыток")
+    raise RuntimeError(f"Не удалось установить премиум для user_id={user_id} после {MAX_RETRIES} попыток")
 
 # ---------- Отслеживание пользователей ----------
 async def track_user_interaction(user_id: int) -> None:

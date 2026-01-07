@@ -1381,11 +1381,16 @@ def main():
     
     async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Обработчик успешного платежа."""
+        logging.info(f"💰 Получен успешный платеж от user {update.effective_user.id if update.effective_user else 'unknown'}")
+        
         if not update.message or not update.message.successful_payment:
+            logging.warning("⚠️ successful_payment_callback вызван, но нет update.message или successful_payment")
             return
         
         payment = update.message.successful_payment
         user_id = update.message.from_user.id
+        
+        logging.info(f"💰 Обработка платежа для user_id={user_id}, payload={payment.invoice_payload}, charge_id={payment.provider_payment_charge_id}")
         
         try:
             # Завершаем платеж и активируем премиум
@@ -1438,10 +1443,12 @@ def main():
                     f"Currency: {payment.currency}"
                 )
         except Exception as e:
-            error_details = str(e)
+            import traceback
+            error_details = traceback.format_exc()
             logging.error(
-                f"❌ Ошибка при обработке успешного платежа: {e}\n"
+                f"❌ КРИТИЧЕСКАЯ ОШИБКА при обработке успешного платежа: {e}\n"
                 f"User ID: {user_id if 'user_id' in locals() else 'unknown'}\n"
+                f"Полный traceback:\n{error_details}"
                 f"Payload: {payment.invoice_payload if 'payment' in locals() else 'unknown'}",
                 exc_info=True
             )
