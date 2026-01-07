@@ -744,8 +744,13 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 send_email_to_provider=False,
                 is_flexible=False,
             )
-            # Сохраняем информацию о платеже в БД
-            await save_payment(user_id, payload, 99, "RUB", "1month", 30)
+            # Сохраняем информацию о платеже в БД (amount в копейках)
+            try:
+                await save_payment(user_id, payload, 99 * 100, "RUB", "1month", 30)
+                logging.info(f"✅ Платеж сохранен в БД: user_id={user_id}, payload={payload}")
+            except Exception as save_error:
+                logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
+                # Продолжаем - инвойс уже отправлен
         except Exception as e:
             logging.error(f"Error sending invoice for 1 month: {e}", exc_info=True)
             await query.message.reply_text(
@@ -777,8 +782,13 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 send_email_to_provider=False,
                 is_flexible=False,
             )
-            # Сохраняем информацию о платеже в БД
-            await save_payment(user_id, payload, 270, "RUB", "3months", 90)
+            # Сохраняем информацию о платеже в БД (amount в копейках)
+            try:
+                await save_payment(user_id, payload, 270 * 100, "RUB", "3months", 90)
+                logging.info(f"✅ Платеж сохранен в БД: user_id={user_id}, payload={payload}")
+            except Exception as save_error:
+                logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
+                # Продолжаем - инвойс уже отправлен
         except Exception as e:
             logging.error(f"Error sending invoice for 3 months: {e}", exc_info=True)
             await query.message.reply_text(
@@ -917,8 +927,11 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         logging.error(f"Error in stats_command: {e}", exc_info=True)
+        error_details = str(e)
         await update.message.reply_text(
-            "❌ Произошла ошибка при получении статистики. Пожалуйста, попробуйте позже."
+            f"❌ Произошла ошибка при получении статистики.\n\n"
+            f"Ошибка: {error_details}\n\n"
+            f"Пожалуйста, проверьте логи для подробностей."
         )
 
 async def test_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1348,18 +1361,118 @@ def main():
                 await update.message.reply_text(success_text, parse_mode="Markdown")
                 logging.info(f"✅ Премиум активирован для пользователя {user_id} до {until_str}")
             else:
-                await update.message.reply_text(
-                    "❌ Ошибка при обработке платежа. Пожалуйста, свяжитесь с поддержкой."
+                # Платеж не найден - это критическая ошибка
+                error_msg = (
+                    f"❌ Ошибка при обработке платежа.\n\n"
+                    f"Платеж получен, но не найден в базе данных.\n\n"
+                    f"**Не волнуйтесь!** Ваши деньги в безопасности.\n\n"
+                    f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
+                    f"• Ваш user_id: {user_id}\n"
+                    f"• Payload: {payment.invoice_payload}\n"
+                    f"• Payment ID: {payment.provider_payment_charge_id}\n\n"
+                    f"Мы активируем премиум вручную."
                 )
-                logging.error(f"❌ Не удалось найти платеж с payload: {payment.invoice_payload}")
+                await update.message.reply_text(error_msg, parse_mode="Markdown")
+                logging.error(
+                    f"❌ КРИТИЧЕСКАЯ ОШИБКА: Платеж не найден в БД!\n"
+                    f"User ID: {user_id}\n"
+                    f"Payload: {payment.invoice_payload}\n"
+                    f"Provider Payment ID: {payment.provider_payment_charge_id}\n"
+                    f"Total Amount: {payment.total_amount}\n"
+                    f"Currency: {payment.currency}"
+                )
         except Exception as e:
-            logging.error(f"❌ Ошибка при обработке успешного платежа: {e}", exc_info=True)
-            await update.message.reply_text(
-                "❌ Произошла ошибка при активации премиума. Пожалуйста, свяжитесь с поддержкой."
+            error_details = str(e)
+            logging.error(
+                f"❌ Ошибка при обработке успешного платежа: {e}\n"
+                f"User ID: {user_id if 'user_id' in locals() else 'unknown'}\n"
+                f"Payload: {payment.invoice_payload if 'payment' in locals() else 'unknown'}",
+                exc_info=True
             )
+            error_msg = (
+                f"❌ Произошла ошибка при активации премиума.\n\n"
+                f"**Не волнуйтесь!** Ваши деньги в безопасности.\n\n"
+                f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
+                f"• Ваш user_id: {user_id if 'user_id' in locals() else 'неизвестен'}\n"
+                f"• Payload: {payment.invoice_payload if 'payment' in locals() else 'неизвестен'}\n\n"
+                f"Мы активируем премиум вручную.\n\n"
+                f"Ошибка: {error_details}"
+            )
+            await update.message.reply_text(error_msg, parse_mode="Markdown")
     
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    
+    # Команда для ручной активации премиума администратором
+    async def activate_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ручная активация премиума администратором (формат: /activate_premium user_id days)."""
+        if not update.message:
+            return
+        
+        user_id = update.effective_user.id
+        
+        # Проверяем, является ли пользователь администратором
+        if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+            await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+            return
+        
+        try:
+            # Парсим аргументы: /activate_premium user_id days
+            args = context.args
+            if len(args) < 2:
+                await update.message.reply_text(
+                    "Использование: /activate_premium <user_id> <days>\n\n"
+                    "Пример: /activate_premium 123456789 30"
+                )
+                return
+            
+            target_user_id = int(args[0])
+            days = int(args[1])
+            
+            # Активируем премиум
+            now = datetime.now(timezone.utc)
+            premium_until = now + timedelta(days=days)
+            await set_user_premium(target_user_id, True, premium_until)
+            
+            moscow_tz = timezone(timedelta(hours=3))
+            until_local = premium_until.astimezone(moscow_tz)
+            until_str = until_local.strftime("%d.%m.%Y")
+            
+            await update.message.reply_text(
+                f"✅ Премиум активирован!\n\n"
+                f"User ID: {target_user_id}\n"
+                f"Дней: {days}\n"
+                f"Действует до: {until_str}"
+            )
+            
+            # Отправляем уведомление пользователю
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=(
+                        f"✅ **Ваш премиум активирован администратором!**\n\n"
+                        f"✨ Премиум-подписка активна на {days} дней!\n\n"
+                        f"📅 Подписка действует до: {until_str}\n\n"
+                        f"Теперь вам доступны все премиум-функции:\n"
+                        f"• 👶 Профиль ребенка\n"
+                        f"• 📊 Дневник лекарств\n"
+                        f"• 🚩 Красные флаги\n\n"
+                        f"Спасибо! 💚"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as notify_error:
+                logging.warning(f"Не удалось отправить уведомление пользователю {target_user_id}: {notify_error}")
+            
+            logging.info(f"Admin {user_id} manually activated premium for user {target_user_id} for {days} days")
+            
+        except ValueError:
+            await update.message.reply_text("❌ Ошибка: user_id и days должны быть числами.")
+        except Exception as e:
+            logging.error(f"Error in activate_premium_command: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+    
+    application.add_handler(CommandHandler("activate_premium", activate_premium_command))
     
     application.add_handler(build_feedback_conversation())
 

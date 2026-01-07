@@ -643,80 +643,131 @@ async def get_bot_statistics() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         
-        # Всего уникальных пользователей
-        async with db.execute("SELECT COUNT(DISTINCT user_id) as count FROM bot_users") as cursor:
-            row = await cursor.fetchone()
-            stats["total_users"] = row[0] if row else 0
-        
-        # Активные пользователи за 30 дней
-        async with db.execute("""
-            SELECT COUNT(DISTINCT user_id) as count 
-            FROM bot_users 
-            WHERE last_seen_at >= ?
-        """, (thirty_days_ago.isoformat(),)) as cursor:
-            row = await cursor.fetchone()
-            stats["active_users_30d"] = row[0] if row else 0
-        
-        # Активные пользователи за 7 дней
-        async with db.execute("""
-            SELECT COUNT(DISTINCT user_id) as count 
-            FROM bot_users 
-            WHERE last_seen_at >= ?
-        """, (seven_days_ago.isoformat(),)) as cursor:
-            row = await cursor.fetchone()
-            stats["active_users_7d"] = row[0] if row else 0
-        
-        # Активные премиум подписки
-        async with db.execute("""
-            SELECT COUNT(*) as count 
-            FROM user_premium 
-            WHERE is_premium = 1 
-                AND (premium_until IS NULL OR premium_until > ?)
-        """, (now.isoformat(),)) as cursor:
-            row = await cursor.fetchone()
-            stats["premium_active"] = row[0] if row else 0
-        
-        # Всего когда-либо было премиум подписок
-        async with db.execute("SELECT COUNT(*) as count FROM user_premium WHERE is_premium = 1 OR premium_until IS NOT NULL") as cursor:
-            row = await cursor.fetchone()
-            stats["premium_total"] = row[0] if row else 0
-        
-        # Успешные платежи
-        async with db.execute("""
-            SELECT COUNT(*) as count, SUM(amount) as total
-            FROM payments 
-            WHERE status = 'completed'
-        """) as cursor:
-            row = await cursor.fetchone()
-            stats["payments_completed"] = row[0] if row and row[0] else 0
-            stats["revenue_total"] = row[1] if row and row[1] else 0
-        
-        # Ожидающие платежи
-        async with db.execute("""
-            SELECT COUNT(*) as count 
-            FROM payments 
-            WHERE status = 'pending'
-        """) as cursor:
-            row = await cursor.fetchone()
-            stats["payments_pending"] = row[0] if row else 0
-        
-        # Подписки на 1 месяц
-        async with db.execute("""
-            SELECT COUNT(*) as count 
-            FROM payments 
-            WHERE status = 'completed' AND subscription_type = '1month'
-        """) as cursor:
-            row = await cursor.fetchone()
-            stats["subscriptions_1month"] = row[0] if row else 0
-        
-        # Подписки на 3 месяца
-        async with db.execute("""
-            SELECT COUNT(*) as count 
-            FROM payments 
-            WHERE status = 'completed' AND subscription_type = '3months'
-        """) as cursor:
-            row = await cursor.fetchone()
-            stats["subscriptions_3months"] = row[0] if row else 0
+        try:
+            # Всего уникальных пользователей (из bot_users или из других таблиц)
+            try:
+                async with db.execute("SELECT COUNT(DISTINCT user_id) as count FROM bot_users") as cursor:
+                    row = await cursor.fetchone()
+                    stats["total_users"] = row[0] if row and row[0] is not None else 0
+            except Exception:
+                # Если таблица bot_users не существует, считаем из других таблиц
+                async with db.execute("""
+                    SELECT COUNT(DISTINCT user_id) as count FROM (
+                        SELECT user_id FROM user_premium
+                        UNION
+                        SELECT user_id FROM child_profiles
+                        UNION
+                        SELECT user_id FROM dose_events
+                    )
+                """) as cursor:
+                    row = await cursor.fetchone()
+                    stats["total_users"] = row[0] if row and row[0] is not None else 0
+            
+            # Активные пользователи за 30 дней
+            try:
+                async with db.execute("""
+                    SELECT COUNT(DISTINCT user_id) as count 
+                    FROM bot_users 
+                    WHERE last_seen_at >= ?
+                """, (thirty_days_ago.isoformat(),)) as cursor:
+                    row = await cursor.fetchone()
+                    stats["active_users_30d"] = row[0] if row and row[0] is not None else 0
+            except Exception:
+                stats["active_users_30d"] = 0
+            
+            # Активные пользователи за 7 дней
+            try:
+                async with db.execute("""
+                    SELECT COUNT(DISTINCT user_id) as count 
+                    FROM bot_users 
+                    WHERE last_seen_at >= ?
+                """, (seven_days_ago.isoformat(),)) as cursor:
+                    row = await cursor.fetchone()
+                    stats["active_users_7d"] = row[0] if row and row[0] is not None else 0
+            except Exception:
+                stats["active_users_7d"] = 0
+            
+            # Активные премиум подписки
+            async with db.execute("""
+                SELECT COUNT(*) as count 
+                FROM user_premium 
+                WHERE is_premium = 1 
+                    AND (premium_until IS NULL OR premium_until > ?)
+            """, (now.isoformat(),)) as cursor:
+                row = await cursor.fetchone()
+                stats["premium_active"] = row[0] if row and row[0] is not None else 0
+            
+            # Всего когда-либо было премиум подписок
+            async with db.execute("SELECT COUNT(*) as count FROM user_premium WHERE is_premium = 1 OR premium_until IS NOT NULL") as cursor:
+                row = await cursor.fetchone()
+                stats["premium_total"] = row[0] if row and row[0] is not None else 0
+            
+            # Успешные платежи
+            try:
+                async with db.execute("""
+                    SELECT COUNT(*) as count, SUM(amount) as total
+                    FROM payments 
+                    WHERE status = 'completed'
+                """) as cursor:
+                    row = await cursor.fetchone()
+                    stats["payments_completed"] = row[0] if row and row[0] is not None else 0
+                    stats["revenue_total"] = int(row[1]) if row and row[1] is not None else 0
+            except Exception:
+                stats["payments_completed"] = 0
+                stats["revenue_total"] = 0
+            
+            # Ожидающие платежи
+            try:
+                async with db.execute("""
+                    SELECT COUNT(*) as count 
+                    FROM payments 
+                    WHERE status = 'pending'
+                """) as cursor:
+                    row = await cursor.fetchone()
+                    stats["payments_pending"] = row[0] if row and row[0] is not None else 0
+            except Exception:
+                stats["payments_pending"] = 0
+            
+            # Подписки на 1 месяц
+            try:
+                async with db.execute("""
+                    SELECT COUNT(*) as count 
+                    FROM payments 
+                    WHERE status = 'completed' AND subscription_type = '1month'
+                """) as cursor:
+                    row = await cursor.fetchone()
+                    stats["subscriptions_1month"] = row[0] if row and row[0] is not None else 0
+            except Exception:
+                stats["subscriptions_1month"] = 0
+            
+            # Подписки на 3 месяца
+            try:
+                async with db.execute("""
+                    SELECT COUNT(*) as count 
+                    FROM payments 
+                    WHERE status = 'completed' AND subscription_type = '3months'
+                """) as cursor:
+                    row = await cursor.fetchone()
+                    stats["subscriptions_3months"] = row[0] if row and row[0] is not None else 0
+            except Exception:
+                stats["subscriptions_3months"] = 0
+                
+        except Exception as e:
+            import logging
+            logging.error(f"Error in get_bot_statistics: {e}", exc_info=True)
+            # Возвращаем пустую статистику в случае ошибки
+            stats = {
+                "total_users": 0,
+                "active_users_30d": 0,
+                "active_users_7d": 0,
+                "premium_active": 0,
+                "premium_total": 0,
+                "payments_completed": 0,
+                "payments_pending": 0,
+                "revenue_total": 0,
+                "subscriptions_1month": 0,
+                "subscriptions_3months": 0
+            }
     
     return stats
 
@@ -744,20 +795,27 @@ async def save_payment(
     now = datetime.now(timezone.utc)
     
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO payments
-            (user_id, invoice_payload, amount, currency, subscription_type, subscription_days, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-        """, (
-            user_id,
-            invoice_payload,
-            amount,
-            currency,
-            subscription_type,
-            subscription_days,
-            now.isoformat()
-        ))
-        await db.commit()
+        try:
+            await db.execute("""
+                INSERT INTO payments
+                (user_id, invoice_payload, amount, currency, subscription_type, subscription_days, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+            """, (
+                user_id,
+                invoice_payload,
+                amount,
+                currency,
+                subscription_type,
+                subscription_days,
+                now.isoformat()
+            ))
+            await db.commit()
+            import logging
+            logging.info(f"✅ Платеж сохранен: user_id={user_id}, payload={invoice_payload}, amount={amount} {currency}")
+        except Exception as e:
+            import logging
+            logging.error(f"❌ Ошибка при сохранении платежа в БД: {e}", exc_info=True)
+            raise
 
 async def complete_payment(
     invoice_payload: str,
@@ -778,13 +836,80 @@ async def complete_payment(
     
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        # Находим платеж по payload
+        
+        # Сначала пытаемся найти платеж со статусом 'pending'
         async with db.execute("""
             SELECT user_id, subscription_days, status
             FROM payments
             WHERE invoice_payload = ? AND status = 'pending'
         """, (invoice_payload,)) as cursor:
             row = await cursor.fetchone()
+            
+            # Если не нашли pending, проверяем, может быть платеж уже обработан
+            if not row:
+                import logging
+                logging.warning(f"⚠️ Платеж с payload '{invoice_payload}' не найден со статусом 'pending'")
+                
+                # Проверяем, может быть платеж уже был обработан
+                async with db.execute("""
+                    SELECT user_id, subscription_days, status
+                    FROM payments
+                    WHERE invoice_payload = ?
+                """, (invoice_payload,)) as cursor2:
+                    row2 = await cursor2.fetchone()
+                    if row2:
+                        logging.warning(f"⚠️ Платеж с payload '{invoice_payload}' уже обработан (статус: {row2['status']})")
+                        # Если платеж уже обработан, все равно активируем премиум (на случай если активация не прошла)
+                        user_id = row2["user_id"]
+                        subscription_days = row2["subscription_days"]
+                        row = row2  # Используем найденную запись
+                    else:
+                        logging.error(f"❌ Платеж с payload '{invoice_payload}' не найден в БД вообще!")
+                        # Пытаемся извлечь user_id из payload (формат: premium_1month_{user_id}_{timestamp} или premium_3months_{user_id}_{timestamp})
+                        try:
+                            parts = invoice_payload.split('_')
+                            if len(parts) >= 3:
+                                user_id_str = parts[2]
+                                user_id = int(user_id_str)
+                                
+                                # Определяем тип подписки из payload
+                                if '1month' in invoice_payload:
+                                    subscription_days = 30
+                                    amount = 99
+                                elif '3months' in invoice_payload:
+                                    subscription_days = 90
+                                    amount = 270
+                                else:
+                                    logging.error(f"❌ Не удалось определить тип подписки из payload: {invoice_payload}")
+                                    return None
+                                
+                                # Создаем запись о платеже вручную
+                                logging.warning(f"⚠️ Создаем запись о платеже вручную для user_id={user_id}")
+                                await db.execute("""
+                                    INSERT INTO payments
+                                    (user_id, invoice_payload, amount, currency, subscription_type, subscription_days, status, created_at, completed_at, provider_payment_charge_id)
+                                    VALUES (?, ?, ?, 'RUB', ?, ?, 'completed', ?, ?, ?)
+                                """, (
+                                    user_id,
+                                    invoice_payload,
+                                    amount * 100,  # в копейках
+                                    '1month' if subscription_days == 30 else '3months',
+                                    subscription_days,
+                                    now.isoformat(),
+                                    now.isoformat(),
+                                    provider_payment_charge_id
+                                ))
+                                await db.commit()
+                                
+                                # Продолжаем обработку
+                                row = {"user_id": user_id, "subscription_days": subscription_days, "status": "completed"}
+                            else:
+                                logging.error(f"❌ Неверный формат payload: {invoice_payload}")
+                                return None
+                        except (ValueError, IndexError) as e:
+                            logging.error(f"❌ Ошибка при извлечении данных из payload '{invoice_payload}': {e}")
+                            return None
+            
             if not row:
                 return None
             
