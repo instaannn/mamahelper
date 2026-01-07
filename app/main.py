@@ -1601,7 +1601,6 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
                             # Пытаемся активировать вручную
                             try:
                                 from app.storage import set_user_premium
-                                from datetime import timedelta
                                 premium_until = datetime.now(timezone.utc) + timedelta(days=30)  # По умолчанию 30 дней
                                 await set_user_premium(user_id, True, premium_until)
                                 logging.info(f"✅ Премиум активирован вручную для user_id={user_id}")
