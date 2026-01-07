@@ -1587,6 +1587,34 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
                     
                     result = await complete_yookassa_payment(payment_id)
                     
+                    # Если result None, но платеж succeeded - проверяем, может быть премиум уже активирован
+                    if not result:
+                        logging.warning(f"⚠️ complete_yookassa_payment вернул None для платежа {payment_id}, проверяем статус премиума...")
+                        # Проверяем, есть ли премиум у пользователя
+                        from app.storage import is_user_premium
+                        has_premium = await is_user_premium(user_id)
+                        if has_premium:
+                            logging.info(f"ℹ️ Премиум уже активирован для user_id={user_id}, пропускаем отправку уведомления")
+                            continue
+                        else:
+                            logging.error(f"❌ Премиум НЕ активирован для user_id={user_id} после успешной оплаты платежа {payment_id}!")
+                            # Пытаемся активировать вручную
+                            try:
+                                from app.storage import set_user_premium
+                                from datetime import timedelta
+                                premium_until = datetime.now(timezone.utc) + timedelta(days=30)  # По умолчанию 30 дней
+                                await set_user_premium(user_id, True, premium_until)
+                                logging.info(f"✅ Премиум активирован вручную для user_id={user_id}")
+                                result = {
+                                    "user_id": user_id,
+                                    "subscription_days": 30,
+                                    "premium_until": premium_until,
+                                    "payment_id": payment_id
+                                }
+                            except Exception as manual_error:
+                                logging.error(f"❌ Не удалось активировать премиум вручную: {manual_error}", exc_info=True)
+                                continue
+                    
                     if result:
                         # Отправляем уведомление пользователю
                         premium_until = result["premium_until"]
@@ -1624,9 +1652,16 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
                                     WHERE yookassa_payment_id = ?
                                 """, (payment_id,)) as check_cursor:
                                     check_row = await check_cursor.fetchone()
-                                    if check_row and check_row.get("notification_sent_at"):
-                                        logging.info(f"ℹ️ Уведомление для платежа {payment_id} уже было отправлено ранее, пропускаем")
-                                        continue  # Пропускаем отправку, если уже отправлено
+                                    if check_row:
+                                        # Проверяем наличие notification_sent_at (sqlite3.Row не имеет метода .get())
+                                        try:
+                                            notification_sent = check_row["notification_sent_at"] if check_row["notification_sent_at"] else None
+                                        except (KeyError, IndexError):
+                                            notification_sent = None
+                                        
+                                        if notification_sent:
+                                            logging.info(f"ℹ️ Уведомление для платежа {payment_id} уже было отправлено ранее, пропускаем")
+                                            continue  # Пропускаем отправку, если уже отправлено
                             
                             await context.bot.send_message(
                                 chat_id=user_id,
