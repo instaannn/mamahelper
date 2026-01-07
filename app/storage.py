@@ -68,7 +68,7 @@ async def _prune_older_than_24h(user_id: int, drug: str) -> None:
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
         
-        async with await _get_db_connection() as db:
+        async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT) as db:
             if drug:
                 await db.execute("""
                     DELETE FROM dose_events 
@@ -195,8 +195,8 @@ async def has_dose_events(user_id: int) -> bool:
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
         
-        # Используем одно подключение для проверки
-        async with await _get_db_connection() as db:
+        # Используем простое подключение без лишних оптимизаций для быстрой проверки
+        async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT) as db:
             async with db.execute("""
                 SELECT COUNT(*) as count
                 FROM dose_events
@@ -570,56 +570,47 @@ async def _db_connect_with_retry():
 # ---------- Премиум-подписка пользователей ----------
 async def is_user_premium(user_id: int) -> bool:
     """Проверить, есть ли у пользователя премиум-подписка бота."""
-    # Используем retry логику для подключения
+    # Используем простое подключение с retry логикой
     for attempt in range(MAX_RETRIES):
-        db = None
         try:
-            db = await _db_connect_with_retry()
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?",
-                (user_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if not row:
-                    await db.close()
+            async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?",
+                    (user_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if not row:
+                        return False
+                    
+                    # Проверяем is_premium (может быть 0, 1, или булево значение)
+                    is_premium_value = row["is_premium"]
+                    # Преобразуем в булево значение (SQLite хранит как INTEGER: 0 или 1)
+                    is_premium_bool = bool(int(is_premium_value)) if is_premium_value is not None else False
+                    
+                    # Проверяем, не истекла ли подписка
+                    if is_premium_bool:
+                        if row["premium_until"]:
+                            premium_until = datetime.fromisoformat(row["premium_until"])
+                            if datetime.now(timezone.utc) > premium_until:
+                                # Подписка истекла - обновляем статус напрямую в БД
+                                now = datetime.now(timezone.utc)
+                                await db.execute("""
+                                    UPDATE user_premium
+                                    SET is_premium = 0,
+                                        updated_at = ?
+                                    WHERE user_id = ?
+                                """, (now.isoformat(), user_id))
+                                await db.commit()
+                                return False
+                        return True
+                    
                     return False
-                
-                # Проверяем is_premium (может быть 0, 1, или булево значение)
-                is_premium_value = row["is_premium"]
-                # Преобразуем в булево значение (SQLite хранит как INTEGER: 0 или 1)
-                is_premium_bool = bool(int(is_premium_value)) if is_premium_value is not None else False
-                
-                # Проверяем, не истекла ли подписка
-                if is_premium_bool:
-                    if row["premium_until"]:
-                        premium_until = datetime.fromisoformat(row["premium_until"])
-                        if datetime.now(timezone.utc) > premium_until:
-                            # Подписка истекла - обновляем статус напрямую в БД
-                            now = datetime.now(timezone.utc)
-                            await db.execute("""
-                                UPDATE user_premium
-                                SET is_premium = 0,
-                                    updated_at = ?
-                                WHERE user_id = ?
-                            """, (now.isoformat(), user_id))
-                            await db.commit()
-                            await db.close()
-                            return False
-                    await db.close()
-                    return True
-                
-                await db.close()
-                return False
         except aiosqlite.OperationalError as e:
-            if db:
-                try:
-                    await db.close()
-                except:
-                    pass
-            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+            error_msg = str(e).lower()
+            if ("database is locked" in error_msg or "connection closed" in error_msg or "closed" in error_msg) and attempt < MAX_RETRIES - 1:
                 delay = RETRY_DELAY * (2 ** attempt)
-                logging.warning(f"⚠️ БД заблокирована при проверке премиума для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                logging.warning(f"⚠️ БД заблокирована/закрыта при проверке премиума для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
                 await asyncio.sleep(delay)
                 continue
             else:
@@ -627,19 +618,13 @@ async def is_user_premium(user_id: int) -> bool:
                 logging.warning(f"⚠️ Ошибка БД при проверке премиума для user_id={user_id}: {e}, возвращаем False")
                 return False
         except Exception as e:
-            if db:
-                try:
-                    await db.close()
-                except:
-                    pass
             error_msg = str(e).lower()
             # Обрабатываем различные типы ошибок
-            if "connection closed" in error_msg or "closed" in error_msg:
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_DELAY * (2 ** attempt)
-                    logging.warning(f"⚠️ Соединение закрыто при проверке премиума для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
-                    await asyncio.sleep(delay)
-                    continue
+            if ("connection closed" in error_msg or "closed" in error_msg) and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)
+                logging.warning(f"⚠️ Соединение закрыто при проверке премиума для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                await asyncio.sleep(delay)
+                continue
             # В случае любой ошибки считаем, что премиум нет (безопасный вариант)
             logging.warning(f"⚠️ Ошибка при проверке премиума для user_id={user_id}: {e}, возвращаем False")
             return False

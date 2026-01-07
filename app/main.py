@@ -212,10 +212,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         # Для первого визита используем Markdown для форматирования
-        if is_first_visit:
-            await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
-        else:
-            await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+        try:
+            if is_first_visit:
+                await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
+            else:
+                await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+        except Exception as send_error:
+            # Обрабатываем таймауты и другие ошибки отправки
+            from telegram.error import TimedOut
+            if isinstance(send_error, TimedOut):
+                logging.warning(f"⚠️ Таймаут при отправке сообщения пользователю {update.effective_user.id}, но сообщение может быть доставлено")
+                # Не пробрасываем ошибку дальше, так как сообщение может быть доставлено
+            else:
+                # Для других ошибок пробрасываем дальше
+                raise
     except Exception as e:
         # Детальное логирование ошибки
         import traceback
