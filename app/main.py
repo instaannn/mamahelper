@@ -176,25 +176,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.debug(f"User {user.id} имеет активный премиум - это не первый визит")
         else:
             # Если нет профиля и нет записей - это первый визит
+            # Убрали дополнительную проверку БД для ускорения - track_user_interaction уже обновит bot_users
             is_first_visit = not has_profile and not has_events
-            
-            # Дополнительно проверяем таблицу bot_users для точности
-            from app.storage import DB_PATH
-            import aiosqlite
-            try:
-                async with aiosqlite.connect(DB_PATH, timeout=5.0) as check_db:
-                    async with check_db.execute(
-                        "SELECT first_seen_at FROM bot_users WHERE user_id = ?",
-                        (user.id,)
-                    ) as cursor:
-                        user_record = await cursor.fetchone()
-                        if user_record:
-                            # Пользователь уже был в боте ранее - это не первый визит
-                            is_first_visit = False
-                            logging.debug(f"User {user.id} уже был в боте ранее (first_seen_at: {user_record[0]})")
-            except Exception as check_error:
-                # Если не удалось проверить - используем текущую логику
-                logging.debug(f"Не удалось проверить историю пользователя {user.id}: {check_error}")
         
         logging.info(f"User {user.id} ({user_name}) - Bot Premium status: {is_premium}, First visit: {is_first_visit}")
         
@@ -250,9 +233,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_premium:
             keyboard.append([InlineKeyboardButton("👶 Профиль", callback_data="start_profile")])
             
-            # Кнопка дневника (только если есть записи)
-            from app.storage import has_dose_events
-            if await has_dose_events(user.id):
+            # Кнопка дневника (только если есть записи) - используем уже полученное значение has_events
+            if has_events:
                 keyboard.append([InlineKeyboardButton("📖 Посмотреть дневник приема лекарств", callback_data="dose_diary")])
         
         # Кнопки красных флагов (только для премиум)
@@ -290,7 +272,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await asyncio.wait_for(
                     update.message.reply_text(welcome_text, reply_markup=reply_markup),
-                    timeout=10.0
+                    timeout=20.0  # Увеличиваем таймаут для стабильности
                 )
                 logging.debug(f"✅ Сообщение отправлено для user {user_id}")
         except Exception as send_error:
@@ -1723,7 +1705,20 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
                 
                 elif status == "canceled":
                     logging.info(f"ℹ️ Платеж {payment_id} отменен")
-                    # Можно обновить статус в БД, но не обязательно
+                    # Обновляем статус в БД, чтобы не проверять его повторно
+                    try:
+                        from app.storage import DB_PATH
+                        import aiosqlite
+                        async with aiosqlite.connect(DB_PATH, timeout=10.0) as db:
+                            await db.execute("""
+                                UPDATE payments
+                                SET status = 'canceled'
+                                WHERE yookassa_payment_id = ? AND status = 'pending'
+                            """, (payment_id,))
+                            await db.commit()
+                            logging.debug(f"✅ Статус платежа {payment_id} обновлен на 'canceled' в БД")
+                    except Exception as update_error:
+                        logging.warning(f"⚠️ Не удалось обновить статус отмененного платежа {payment_id}: {update_error}")
                 
                 # Небольшая задержка между проверками, чтобы не перегружать API
                 await asyncio.sleep(0.5)
@@ -1878,10 +1873,11 @@ def main():
         # Оптимизированные таймауты для HTTP запросов к Telegram API
         from telegram.request import HTTPXRequest
         request = HTTPXRequest(
-            connection_pool_size=8,
-            read_timeout=20.0,  # Увеличиваем для стабильности при медленном интернете
-            write_timeout=20.0,  # Увеличиваем для стабильности
-            connect_timeout=10.0,  # Увеличиваем таймаут подключения для сетевых проблем
+            connection_pool_size=16,  # Увеличиваем пул соединений для лучшей производительности
+            read_timeout=30.0,  # Увеличиваем для стабильности при медленном интернете
+            write_timeout=30.0,  # Увеличиваем для стабильности
+            connect_timeout=15.0,  # Увеличиваем таймаут подключения для сетевых проблем
+            pool_timeout=10.0,  # Таймаут ожидания свободного соединения из пула
         )
         
         application = Application.builder().token(API_TOKEN).request(request).post_init(post_init).build()
