@@ -315,7 +315,29 @@ async def handle_safety_answer(update: Update, context: ContextTypes.DEFAULT_TYP
     if queue:
         context.user_data["current_check"] = queue.pop(0)
         kb = ReplyKeyboardMarkup([["Да", "Нет"]], one_time_keyboard=True, resize_keyboard=True)
-        await update.message.reply_text(context.user_data["current_check"][1], reply_markup=kb)
+        # Отправляем с обработкой таймаутов
+        import asyncio
+        try:
+            await asyncio.wait_for(
+                update.message.reply_text(context.user_data["current_check"][1], reply_markup=kb),
+                timeout=10.0
+            )
+        except (asyncio.TimeoutError, Exception) as send_error:
+            from telegram.error import TimedOut
+            if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
+                # Пробуем отправить упрощенное сообщение
+                try:
+                    await asyncio.wait_for(
+                        update.message.reply_text(
+                            context.user_data["current_check"][1],
+                            reply_markup=kb
+                        ),
+                        timeout=5.0
+                    )
+                except Exception:
+                    pass
+            else:
+                raise
         return ASK_SAFETY
 
     # Очередь пустая — считаем дозу и завершаем
@@ -555,7 +577,29 @@ async def calculate_and_finish(update: Update, context: ContextTypes.DEFAULT_TYP
     res = calc_dose(req)
 
     if not res.ok:
-        await update.message.reply_text(f"⚠️ {res.message}\n{DISCLAIMER}", reply_markup=ReplyKeyboardRemove())
+        # Отправляем с обработкой таймаутов
+        import asyncio
+        try:
+            await asyncio.wait_for(
+                update.message.reply_text(f"⚠️ {res.message}\n{DISCLAIMER}", reply_markup=ReplyKeyboardRemove()),
+                timeout=10.0
+            )
+        except (asyncio.TimeoutError, Exception) as send_error:
+            from telegram.error import TimedOut
+            if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
+                # Пробуем отправить упрощенное сообщение
+                try:
+                    await asyncio.wait_for(
+                        update.message.reply_text(
+                            f"⚠️ {res.message}",
+                            reply_markup=ReplyKeyboardRemove()
+                        ),
+                        timeout=5.0
+                    )
+                except Exception:
+                    pass
+            else:
+                raise
         return ConversationHandler.END
 
     conc_text = f"{u['conc_mg_per_ml']:.1f} мг/мл" + (f" ({u.get('conc_label')})" if u.get("conc_label") else "")
@@ -669,7 +713,42 @@ async def calculate_and_finish(update: Update, context: ContextTypes.DEFAULT_TYP
     
     kb = InlineKeyboardMarkup(buttons)
 
-    await update.message.reply_text(full_text, reply_markup=kb)
+    # Отправляем с обработкой таймаутов
+    import asyncio
+    try:
+        await asyncio.wait_for(
+            update.message.reply_text(full_text, reply_markup=kb),
+            timeout=15.0
+        )
+    except (asyncio.TimeoutError, Exception) as send_error:
+        from telegram.error import TimedOut
+        if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
+            # Пробуем отправить упрощенное сообщение с основной информацией
+            try:
+                simplified_text = (
+                    f"🔶 Разовая доза: ≈{res.dose_mg:.0f} мг (≈{res.dose_ml:.1f} мл)\n\n"
+                    f"• Вес: {u['weight']} кг\n"
+                    f"• {formula_line}\n\n"
+                    f"⚠️ Это справочная информация, не заменяет консультацию врача."
+                )
+                await asyncio.wait_for(
+                    update.message.reply_text(simplified_text, reply_markup=kb),
+                    timeout=10.0
+                )
+            except Exception:
+                # Если и упрощенное сообщение не отправилось, пробуем без клавиатуры
+                try:
+                    await asyncio.wait_for(
+                        update.message.reply_text(
+                            f"Доза: ≈{res.dose_ml:.1f} мл ({formula_line})",
+                            timeout=5.0
+                        ),
+                        timeout=5.0
+                    )
+                except Exception:
+                    pass
+        else:
+            raise
     return ConversationHandler.END
 
 def build_calculate_conversation():
