@@ -96,20 +96,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"Received /start command from user {update.effective_user.id}")
     
-    # Показываем индикатор печати и отправляем временное сообщение о загрузке
+    # Показываем индикатор печати и отправляем сообщение о загрузке
     loading_message = None
+    
+    # Показываем индикатор печати
     try:
-        # Показываем индикатор печати
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
             action=ChatAction.TYPING
         )
-        
-        # Отправляем видимое сообщение о загрузке
-        loading_message = await update.message.reply_text("⏳ Загрузка...")
-    except Exception as action_error:
-        # Не критично, продолжаем работу
-        logging.debug(f"Не удалось показать индикатор загрузки: {action_error}")
+    except Exception:
+        pass  # Не критично, продолжаем работу
+    
+    # Отправляем сообщение о загрузке (с таймаутом, чтобы не блокировать)
+    try:
+        loading_message = await asyncio.wait_for(
+            update.message.reply_text("⏳ Загрузка..."),
+            timeout=3.0
+        )
+    except (asyncio.TimeoutError, Exception) as load_error:
+        logging.debug(f"Не удалось отправить сообщение о загрузке: {load_error}")
+        loading_message = None
     
     try:
         user = update.effective_user
@@ -117,7 +124,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_name = user.first_name or user.username or "друг"
         
         # Оптимизация: выполняем критичные проверки параллельно, track_user_interaction - асинхронно
-        import asyncio
         from app.storage import has_dose_events
         
         # Запускаем критичные проверки параллельно (без track_user_interaction для ускорения)
@@ -237,13 +243,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Удаляем временное сообщение о загрузке, если оно было отправлено
+        # Удаляем сообщение о загрузке, если оно было отправлено
         if loading_message:
             try:
                 await loading_message.delete()
-            except Exception as delete_error:
-                # Не критично, продолжаем
-                logging.debug(f"Не удалось удалить сообщение о загрузке: {delete_error}")
+            except Exception:
+                pass  # Не критично
         
         # Для первого визита используем Markdown для форматирования
         try:
@@ -261,7 +266,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Для других ошибок пробрасываем дальше
                 raise
     except Exception as e:
-        # Удаляем временное сообщение о загрузке при ошибке
+        # Удаляем сообщение о загрузке при ошибке (если было отправлено)
         if loading_message:
             try:
                 await loading_message.delete()
