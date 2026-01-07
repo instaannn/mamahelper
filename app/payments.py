@@ -117,6 +117,24 @@ async def create_payment(
                 "subscription_type": subscription_type,
                 "subscription_days": str(subscription_days),
                 "payload": payload
+            },
+            # Добавляем receipt для формирования чека
+            # Если не указать customer.email, ЮKassa запросит его у пользователя на странице оплаты
+            # Это сделает email обязательным полем для получения чека
+            "receipt": {
+                # customer не указываем - ЮKassa запросит email у пользователя на странице оплаты
+                "items": [
+                    {
+                        "description": description,
+                        "quantity": "1",
+                        "amount": {
+                            "value": f"{amount:.2f}",
+                            "currency": "RUB"
+                        },
+                        "vat_code": 1  # НДС не облагается (для услуг)
+                    }
+                ],
+                "tax_system_code": 1  # Упрощенная система налогообложения (УСН)
             }
         }
         
@@ -186,6 +204,17 @@ async def get_payment_status(payment_id: str) -> Optional[Dict[str, Any]]:
     try:
         payment = Payment.find_one(payment_id)
         
+        # Получаем информацию о чеке, если она доступна
+        receipt_info = None
+        if hasattr(payment, 'receipt') and payment.receipt:
+            receipt_info = {
+                "receipt_registration": getattr(payment.receipt, 'receipt_registration', None),
+                "fiscal_storage_number": getattr(payment.receipt, 'fiscal_storage_number', None),
+                "fiscal_document_number": getattr(payment.receipt, 'fiscal_document_number', None),
+                "fiscal_attribute": getattr(payment.receipt, 'fiscal_attribute', None),
+                "fiscal_provider_id": getattr(payment.receipt, 'fiscal_provider_id', None),
+            }
+        
         return {
             "payment_id": payment.id,
             "status": payment.status,
@@ -193,7 +222,8 @@ async def get_payment_status(payment_id: str) -> Optional[Dict[str, Any]]:
             "currency": payment.amount.currency,
             "metadata": payment.metadata if hasattr(payment, 'metadata') else {},
             "paid": payment.paid if hasattr(payment, 'paid') else False,
-            "created_at": payment.created_at if hasattr(payment, 'created_at') else None
+            "created_at": payment.created_at if hasattr(payment, 'created_at') else None,
+            "receipt": receipt_info  # Информация о чеке
         }
     except Exception as e:
         logging.error(f"❌ Ошибка при получении статуса платежа {payment_id}: {e}", exc_info=True)

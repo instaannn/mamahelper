@@ -1262,8 +1262,19 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        # Получаем статистику
-        stats = await get_bot_statistics()
+        # Получаем статистику с таймаутом (30 секунд)
+        try:
+            stats = await asyncio.wait_for(get_bot_statistics(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logging.error(f"Timeout while getting statistics for admin {user_id}")
+            await update.message.reply_text(
+                "❌ Превышено время ожидания при получении статистики.\n\n"
+                "База данных может быть перегружена. Попробуйте позже."
+            )
+            return
+        except Exception as stats_error:
+            logging.error(f"Error getting statistics: {stats_error}", exc_info=True)
+            raise
         
         # Форматируем выручку (из копеек в рубли)
         revenue_rub = stats["revenue_total"] / 100 if stats["revenue_total"] else 0
@@ -1287,17 +1298,50 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• На 3 месяца: {stats['subscriptions_3months']}\n"
         )
         
-        await update.message.reply_text(stats_text, parse_mode="Markdown")
+        # Отправляем сообщение с обработкой таймаутов
+        try:
+            await asyncio.wait_for(
+                update.message.reply_text(stats_text, parse_mode="Markdown"),
+                timeout=10.0
+            )
+        except (asyncio.TimeoutError, Exception) as send_error:
+            from telegram.error import TimedOut
+            if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
+                # Пробуем отправить упрощенное сообщение
+                try:
+                    simplified_text = (
+                        f"📊 Статистика бота\n\n"
+                        f"👥 Пользователей: {stats['total_users']}\n"
+                        f"⭐ Премиум активных: {stats['premium_active']}\n"
+                        f"💳 Платежей: {stats['payments_completed']}\n"
+                        f"💰 Выручка: {revenue_rub:.2f} ₽"
+                    )
+                    await asyncio.wait_for(
+                        update.message.reply_text(simplified_text),
+                        timeout=5.0
+                    )
+                except Exception:
+                    pass
+            else:
+                raise
+        
         logging.info(f"Admin {user_id} requested statistics")
         
     except Exception as e:
         logging.error(f"Error in stats_command: {e}", exc_info=True)
         error_details = str(e)
-        await update.message.reply_text(
-            f"❌ Произошла ошибка при получении статистики.\n\n"
-            f"Ошибка: {error_details}\n\n"
-            f"Пожалуйста, проверьте логи для подробностей."
-        )
+        # Отправляем сообщение об ошибке с обработкой таймаутов
+        try:
+            await asyncio.wait_for(
+                update.message.reply_text(
+                    f"❌ Произошла ошибка при получении статистики.\n\n"
+                    f"Ошибка: {error_details}\n\n"
+                    f"Пожалуйста, проверьте логи для подробностей."
+                ),
+                timeout=5.0
+            )
+        except Exception:
+            pass
 
 async def test_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для тестирования премиум-статуса (переключает статус)."""

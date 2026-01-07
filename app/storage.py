@@ -834,134 +834,170 @@ async def get_bot_statistics() -> dict:
     
     stats = {}
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        
+    # Используем retry логику для подключения к БД и выполнения всех запросов
+    for attempt in range(MAX_RETRIES):
         try:
-            # Всего уникальных пользователей (из bot_users или из других таблиц)
-            try:
-                async with db.execute("SELECT COUNT(DISTINCT user_id) as count FROM bot_users") as cursor:
-                    row = await cursor.fetchone()
-                    stats["total_users"] = row[0] if row and row[0] is not None else 0
-            except Exception:
-                # Если таблица bot_users не существует, считаем из других таблиц
-                async with db.execute("""
-                    SELECT COUNT(DISTINCT user_id) as count FROM (
-                        SELECT user_id FROM user_premium
-                        UNION
-                        SELECT user_id FROM child_profiles
-                        UNION
-                        SELECT user_id FROM dose_events
-                    )
-                """) as cursor:
-                    row = await cursor.fetchone()
-                    stats["total_users"] = row[0] if row and row[0] is not None else 0
-            
-            # Активные пользователи за 30 дней
-            try:
-                async with db.execute("""
-                    SELECT COUNT(DISTINCT user_id) as count 
-                    FROM bot_users 
-                    WHERE last_seen_at >= ?
-                """, (thirty_days_ago.isoformat(),)) as cursor:
-                    row = await cursor.fetchone()
-                    stats["active_users_30d"] = row[0] if row and row[0] is not None else 0
-            except Exception:
-                stats["active_users_30d"] = 0
-            
-            # Активные пользователи за 7 дней
-            try:
-                async with db.execute("""
-                    SELECT COUNT(DISTINCT user_id) as count 
-                    FROM bot_users 
-                    WHERE last_seen_at >= ?
-                """, (seven_days_ago.isoformat(),)) as cursor:
-                    row = await cursor.fetchone()
-                    stats["active_users_7d"] = row[0] if row and row[0] is not None else 0
-            except Exception:
-                stats["active_users_7d"] = 0
-            
-            # Активные премиум подписки
-            async with db.execute("""
-                SELECT COUNT(*) as count 
-                FROM user_premium 
-                WHERE is_premium = 1 
-                    AND (premium_until IS NULL OR premium_until > ?)
-            """, (now.isoformat(),)) as cursor:
-                row = await cursor.fetchone()
-                stats["premium_active"] = row[0] if row and row[0] is not None else 0
-            
-            # Всего когда-либо было премиум подписок
-            async with db.execute("SELECT COUNT(*) as count FROM user_premium WHERE is_premium = 1 OR premium_until IS NOT NULL") as cursor:
-                row = await cursor.fetchone()
-                stats["premium_total"] = row[0] if row and row[0] is not None else 0
-            
-            # Успешные платежи
-            try:
-                async with db.execute("""
-                    SELECT COUNT(*) as count, SUM(amount) as total
-                    FROM payments 
-                    WHERE status = 'completed'
-                """) as cursor:
-                    row = await cursor.fetchone()
-                    stats["payments_completed"] = row[0] if row and row[0] is not None else 0
-                    stats["revenue_total"] = int(row[1]) if row and row[1] is not None else 0
-            except Exception:
-                stats["payments_completed"] = 0
-                stats["revenue_total"] = 0
-            
-            # Ожидающие платежи
-            try:
-                async with db.execute("""
-                    SELECT COUNT(*) as count 
-                    FROM payments 
-                    WHERE status = 'pending'
-                """) as cursor:
-                    row = await cursor.fetchone()
-                    stats["payments_pending"] = row[0] if row and row[0] is not None else 0
-            except Exception:
-                stats["payments_pending"] = 0
-            
-            # Подписки на 1 месяц
-            try:
-                async with db.execute("""
-                    SELECT COUNT(*) as count 
-                    FROM payments 
-                    WHERE status = 'completed' AND subscription_type = '1month'
-                """) as cursor:
-                    row = await cursor.fetchone()
-                    stats["subscriptions_1month"] = row[0] if row and row[0] is not None else 0
-            except Exception:
-                stats["subscriptions_1month"] = 0
-            
-            # Подписки на 3 месяца
-            try:
-                async with db.execute("""
-                    SELECT COUNT(*) as count 
-                    FROM payments 
-                    WHERE status = 'completed' AND subscription_type = '3months'
-                """) as cursor:
-                    row = await cursor.fetchone()
-                    stats["subscriptions_3months"] = row[0] if row and row[0] is not None else 0
-            except Exception:
-                stats["subscriptions_3months"] = 0
+            async with _db_connect_with_retry() as db:
+                db.row_factory = aiosqlite.Row
                 
-        except Exception as e:
-            import logging
-            logging.error(f"Error in get_bot_statistics: {e}", exc_info=True)
-            # Возвращаем пустую статистику в случае ошибки
-            stats = {
-                "total_users": 0,
-                "active_users_30d": 0,
-                "active_users_7d": 0,
-                "premium_active": 0,
-                "premium_total": 0,
-                "payments_completed": 0,
-                "payments_pending": 0,
-                "revenue_total": 0,
-                "subscriptions_1month": 0,
-                "subscriptions_3months": 0
-            }
+                try:
+                    # Всего уникальных пользователей (из bot_users или из других таблиц)
+                    try:
+                        async with db.execute("SELECT COUNT(DISTINCT user_id) as count FROM bot_users") as cursor:
+                            row = await cursor.fetchone()
+                            stats["total_users"] = row[0] if row and row[0] is not None else 0
+                    except Exception:
+                        # Если таблица bot_users не существует, считаем из других таблиц
+                        async with db.execute("""
+                            SELECT COUNT(DISTINCT user_id) as count FROM (
+                                SELECT user_id FROM user_premium
+                                UNION
+                                SELECT user_id FROM child_profiles
+                                UNION
+                                SELECT user_id FROM dose_events
+                            )
+                        """) as cursor:
+                            row = await cursor.fetchone()
+                            stats["total_users"] = row[0] if row and row[0] is not None else 0
+                    
+                    # Активные пользователи за 30 дней
+                    try:
+                        async with db.execute("""
+                            SELECT COUNT(DISTINCT user_id) as count 
+                            FROM bot_users 
+                            WHERE last_seen_at >= ?
+                        """, (thirty_days_ago.isoformat(),)) as cursor:
+                            row = await cursor.fetchone()
+                            stats["active_users_30d"] = row[0] if row and row[0] is not None else 0
+                    except Exception:
+                        stats["active_users_30d"] = 0
+                    
+                    # Активные пользователи за 7 дней
+                    try:
+                        async with db.execute("""
+                            SELECT COUNT(DISTINCT user_id) as count 
+                            FROM bot_users 
+                            WHERE last_seen_at >= ?
+                        """, (seven_days_ago.isoformat(),)) as cursor:
+                            row = await cursor.fetchone()
+                            stats["active_users_7d"] = row[0] if row and row[0] is not None else 0
+                    except Exception:
+                        stats["active_users_7d"] = 0
+                    
+                    # Активные премиум подписки
+                    async with db.execute("""
+                        SELECT COUNT(*) as count 
+                        FROM user_premium 
+                        WHERE is_premium = 1 
+                            AND (premium_until IS NULL OR premium_until > ?)
+                    """, (now.isoformat(),)) as cursor:
+                        row = await cursor.fetchone()
+                        stats["premium_active"] = row[0] if row and row[0] is not None else 0
+                    
+                    # Всего когда-либо было премиум подписок
+                    async with db.execute("SELECT COUNT(*) as count FROM user_premium WHERE is_premium = 1 OR premium_until IS NOT NULL") as cursor:
+                        row = await cursor.fetchone()
+                        stats["premium_total"] = row[0] if row and row[0] is not None else 0
+                    
+                    # Успешные платежи
+                    try:
+                        async with db.execute("""
+                            SELECT COUNT(*) as count, SUM(amount) as total
+                            FROM payments 
+                            WHERE status = 'completed'
+                        """) as cursor:
+                            row = await cursor.fetchone()
+                            stats["payments_completed"] = row[0] if row and row[0] is not None else 0
+                            stats["revenue_total"] = int(row[1]) if row and row[1] is not None else 0
+                    except Exception:
+                        stats["payments_completed"] = 0
+                        stats["revenue_total"] = 0
+                    
+                    # Ожидающие платежи
+                    try:
+                        async with db.execute("""
+                            SELECT COUNT(*) as count 
+                            FROM payments 
+                            WHERE status = 'pending'
+                        """) as cursor:
+                            row = await cursor.fetchone()
+                            stats["payments_pending"] = row[0] if row and row[0] is not None else 0
+                    except Exception:
+                        stats["payments_pending"] = 0
+                    
+                    # Подписки на 1 месяц
+                    try:
+                        async with db.execute("""
+                            SELECT COUNT(*) as count 
+                            FROM payments 
+                            WHERE status = 'completed' AND subscription_type = '1month'
+                        """) as cursor:
+                            row = await cursor.fetchone()
+                            stats["subscriptions_1month"] = row[0] if row and row[0] is not None else 0
+                    except Exception:
+                        stats["subscriptions_1month"] = 0
+                    
+                    # Подписки на 3 месяца
+                    try:
+                        async with db.execute("""
+                            SELECT COUNT(*) as count 
+                            FROM payments 
+                            WHERE status = 'completed' AND subscription_type = '3months'
+                        """) as cursor:
+                            row = await cursor.fetchone()
+                            stats["subscriptions_3months"] = row[0] if row and row[0] is not None else 0
+                    except Exception:
+                        stats["subscriptions_3months"] = 0
+                    
+                    # Успешно выполнили все запросы - выходим из цикла retry
+                    break
+                    
+                except Exception as e:
+                    import logging
+                    logging.error(f"Error in get_bot_statistics (attempt {attempt + 1}): {e}", exc_info=True)
+                    # Если это не последняя попытка, продолжаем
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAY * (2 ** attempt)
+                        logging.warning(f"⚠️ Ошибка БД при получении статистики, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        # Последняя попытка - возвращаем пустую статистику
+                        stats = {
+                            "total_users": 0,
+                            "active_users_30d": 0,
+                            "active_users_7d": 0,
+                            "premium_active": 0,
+                            "premium_total": 0,
+                            "payments_completed": 0,
+                            "payments_pending": 0,
+                            "revenue_total": 0,
+                            "subscriptions_1month": 0,
+                            "subscriptions_3months": 0
+                        }
+                        break
+        except Exception as db_error:
+            # Ошибка подключения к БД
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)
+                logging.warning(f"⚠️ Ошибка подключения к БД при получении статистики, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logging.error(f"❌ Не удалось подключиться к БД для статистики после {MAX_RETRIES} попыток: {db_error}")
+                # Возвращаем пустую статистику
+                return {
+                    "total_users": 0,
+                    "active_users_30d": 0,
+                    "active_users_7d": 0,
+                    "premium_active": 0,
+                    "premium_total": 0,
+                    "payments_completed": 0,
+                    "payments_pending": 0,
+                    "revenue_total": 0,
+                    "subscriptions_1month": 0,
+                    "subscriptions_3months": 0
+                }
     
     return stats
 
