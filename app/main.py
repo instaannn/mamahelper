@@ -327,14 +327,35 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
         premium_markup = InlineKeyboardMarkup(premium_keyboard)
         
+        user_id = query.from_user.id if query.from_user else "unknown"
         try:
-            await query.message.reply_text(premium_text, reply_markup=premium_markup)
-        except Exception as send_error:
+            # Отправляем с таймаутом
+            await asyncio.wait_for(
+                query.message.reply_text(premium_text, reply_markup=premium_markup),
+                timeout=10.0
+            )
+            logging.debug(f"✅ Сообщение о премиум отправлено для user {user_id}")
+        except (asyncio.TimeoutError, Exception) as send_error:
             from telegram.error import TimedOut
-            if isinstance(send_error, TimedOut):
-                logging.warning(f"⚠️ Таймаут при отправке сообщения пользователю {query.from_user.id}, но сообщение может быть доставлено")
+            if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
+                logging.warning(f"⚠️ Таймаут при отправке сообщения о премиум пользователю {user_id}")
+                # Пробуем отправить упрощенное сообщение
+                try:
+                    simple_text = (
+                        "🌟 Премиум-доступ\n\n"
+                        "• 👶 Профиль ребенка\n"
+                        "• 📊 Дневник лекарств\n\n"
+                        "Все расчеты бесплатны! 💚"
+                    )
+                    await asyncio.wait_for(
+                        query.message.reply_text(simple_text, reply_markup=premium_markup),
+                        timeout=5.0
+                    )
+                    logging.info(f"✅ Отправлено упрощенное сообщение о премиум для user {user_id}")
+                except Exception:
+                    logging.error(f"❌ Не удалось отправить даже упрощенное сообщение о премиум для user {user_id}")
             else:
-                logging.error(f"❌ Ошибка при отправке сообщения пользователю {query.from_user.id}: {send_error}")
+                logging.error(f"❌ Ошибка при отправке сообщения о премиум пользователю {user_id}: {send_error}")
                 raise
     
     elif query.data == "start_help":
