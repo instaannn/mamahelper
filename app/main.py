@@ -798,7 +798,17 @@ async def handle_dose_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок покупки премиум - отправка инвойсов."""
     query = update.callback_query
-    await query.answer(text="⏳ Подготовка платежа...", show_alert=False)
+    
+    # Пытаемся показать индикатор загрузки, но не блокируем выполнение при ошибке
+    try:
+        await query.answer(text="⏳ Подготовка платежа...", show_alert=False)
+    except Exception as answer_error:
+        from telegram.error import TimedOut, NetworkError
+        if isinstance(answer_error, (TimedOut, NetworkError)):
+            logging.warning(f"⚠️ Таймаут/ошибка сети при answer callback query для user {query.from_user.id}, продолжаем выполнение")
+        else:
+            logging.warning(f"⚠️ Ошибка при answer callback query для user {query.from_user.id}: {answer_error}")
+        # Продолжаем выполнение - индикатор не критичен
     
     if not PROVIDER_TOKEN:
         await query.message.reply_text(
@@ -841,10 +851,25 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
                 # Продолжаем - инвойс уже отправлен
         except Exception as e:
-            logging.error(f"Error sending invoice for 1 month: {e}", exc_info=True)
-            await query.message.reply_text(
-                "❌ Ошибка при создании счета. Пожалуйста, попробуйте позже."
-            )
+            from telegram.error import TimedOut, NetworkError
+            error_type = type(e).__name__
+            logging.error(f"❌ Ошибка при отправке инвойса для 1 месяца: {error_type}: {e}", exc_info=True)
+            
+            # Пытаемся отправить сообщение об ошибке
+            try:
+                if isinstance(e, (TimedOut, NetworkError)):
+                    error_msg = (
+                        "⚠️ Проблема с подключением к серверу.\n\n"
+                        "Пожалуйста, попробуйте еще раз через несколько секунд."
+                    )
+                else:
+                    error_msg = (
+                        "❌ Ошибка при создании счета.\n\n"
+                        "Пожалуйста, попробуйте позже или свяжитесь с поддержкой."
+                    )
+                await query.message.reply_text(error_msg)
+            except Exception as send_error:
+                logging.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
     
     elif query.data == "premium_buy_3months":
         # Премиум на 3 месяца - 270₽
@@ -871,7 +896,7 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 send_email_to_provider=False,
                 is_flexible=False,
             )
-            # Сохраняем информацию о платеже в БД (amount в копейках)
+            # Сохраняем информацию о платеже в БД (amount в копейках) - не блокируем при ошибке
             try:
                 await save_payment(user_id, payload, 270 * 100, "RUB", "3months", 90)
                 logging.info(f"✅ Платеж сохранен в БД: user_id={user_id}, payload={payload}")
@@ -879,10 +904,25 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
                 # Продолжаем - инвойс уже отправлен
         except Exception as e:
-            logging.error(f"Error sending invoice for 3 months: {e}", exc_info=True)
-            await query.message.reply_text(
-                "❌ Ошибка при создании счета. Пожалуйста, попробуйте позже."
-            )
+            from telegram.error import TimedOut, NetworkError
+            error_type = type(e).__name__
+            logging.error(f"❌ Ошибка при отправке инвойса для 3 месяцев: {error_type}: {e}", exc_info=True)
+            
+            # Пытаемся отправить сообщение об ошибке
+            try:
+                if isinstance(e, (TimedOut, NetworkError)):
+                    error_msg = (
+                        "⚠️ Проблема с подключением к серверу.\n\n"
+                        "Пожалуйста, попробуйте еще раз через несколько секунд."
+                    )
+                else:
+                    error_msg = (
+                        "❌ Ошибка при создании счета.\n\n"
+                        "Пожалуйста, попробуйте позже или свяжитесь с поддержкой."
+                    )
+                await query.message.reply_text(error_msg)
+            except Exception as send_error:
+                logging.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
     
     elif query.data == "premium_support":
         await query.message.reply_text(
@@ -1374,9 +1414,9 @@ def main():
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(
         connection_pool_size=8,
-        read_timeout=15.0,  # Оптимальный таймаут чтения (было 30, уменьшаем для быстрой реакции)
-        write_timeout=15.0,  # Оптимальный таймаут записи
-        connect_timeout=5.0,  # Таймаут подключения
+        read_timeout=20.0,  # Увеличиваем для стабильности при медленном интернете
+        write_timeout=20.0,  # Увеличиваем для стабильности
+        connect_timeout=10.0,  # Увеличиваем таймаут подключения для сетевых проблем
     )
     
     application = Application.builder().token(API_TOKEN).request(request).post_init(post_init).build()
@@ -1683,6 +1723,14 @@ def main():
             logging.info("   1. Подождать 10-15 секунд и перезапустить бота")
             logging.info("   2. Проверить, нет ли других запущенных процессов: ps aux | grep app.main")
             return  # Не отправляем сообщение пользователю для этой ошибки
+        
+        # Обрабатываем сетевые ошибки и таймауты
+        from telegram.error import TimedOut, NetworkError
+        if isinstance(context.error, (TimedOut, NetworkError)):
+            error_type = type(context.error).__name__
+            logging.warning(f"⚠️ Сетевая ошибка/таймаут ({error_type}): {context.error}")
+            # Не отправляем сообщение пользователю - библиотека автоматически повторит запрос
+            return
         
         # Логируем информацию об update для отладки
         update_info = "None"
