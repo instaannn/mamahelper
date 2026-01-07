@@ -51,7 +51,9 @@ async def create_payment(
     subscription_type: str,
     subscription_days: int,
     return_url: Optional[str] = None,
-    bot_username: Optional[str] = None
+    bot_username: Optional[str] = None,
+    customer_phone: Optional[str] = None,
+    customer_email: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Создать платеж через API ЮKassa.
@@ -117,24 +119,72 @@ async def create_payment(
                 "subscription_type": subscription_type,
                 "subscription_days": str(subscription_days),
                 "payload": payload
-            },
-            # Добавляем receipt для формирования чека
-            # Согласно документации ЮKassa, если указан receipt, customer должен содержать валидный email или phone
-            # Для обязательного запроса email на странице оплаты:
-            # - Если не указывать receipt, чек сформируется автоматически через онлайн-кассу, и email будет запрошен
-            # - Если указывать receipt, customer должен содержать валидный email или phone
-            # 
-            # ВАЖНО: Если онлайн-касса настроена в личном кабинете ЮKassa, чек будет формироваться автоматически
-            # и email будет запрошен у пользователя на странице оплаты, даже без указания receipt
-            # 
-            # Если нужно явно указать receipt, можно указать customer с phone (тогда email тоже будет запрошен)
-            # Но лучше не указывать receipt - это проще и работает автоматически
+            }
         }
+        
+        # Если есть номер телефона или email пользователя, добавляем receipt для формирования чека
+        # Это необходимо, если библиотека yookassa автоматически добавляет receipt при включенной онлайн-кассе
+        # Если receipt указан, customer должен содержать валидный email или phone
+        if customer_phone or customer_email:
+            receipt_customer = {}
+            if customer_phone:
+                # Форматируем номер телефона (должен начинаться с +7 для России)
+                phone = customer_phone.strip()
+                if not phone.startswith("+"):
+                    if phone.startswith("8"):
+                        phone = "+7" + phone[1:]
+                    elif phone.startswith("7"):
+                        phone = "+" + phone
+                    else:
+                        phone = "+7" + phone
+                receipt_customer["phone"] = phone
+            if customer_email:
+                receipt_customer["email"] = customer_email.strip()
+            
+            if receipt_customer:
+                payment_data["receipt"] = {
+                    "customer": receipt_customer,
+                    "items": [
+                        {
+                            "description": description[:128],  # Максимум 128 символов
+                            "quantity": "1.00",
+                            "amount": {
+                                "value": f"{amount:.2f}",
+                                "currency": "RUB"
+                            },
+                            "vat_code": 1  # НДС 20%
+                        }
+                    ],
+                    "tax_system_code": 1  # Общая система налогообложения
+                }
+                logging.info(f"📝 Receipt добавлен с customer: {receipt_customer}")
+        else:
+            # Если нет phone/email, не добавляем receipt
+            # ЮKassa автоматически запросит email на странице оплаты, если онлайн-касса настроена
+            logging.info(f"💡 Receipt не добавлен (нет phone/email). ЮKassa запросит email автоматически.")
         
         logging.info(f"📋 Данные платежа: amount={amount} RUB, description={description}")
         logging.info(f"💡 Примечание: payment_method_data не указан - будут доступны все способы оплаты из личного кабинета ЮKassa")
         
-        payment = Payment.create(payment_data, idempotence_key)
+        # Логируем payment_data для отладки (без секретных данных)
+        import json
+        payment_data_str = json.dumps(payment_data, ensure_ascii=False, indent=2)
+        logging.info(f"🔍 Payment data перед отправкой:\n{payment_data_str}")
+        
+        # Убеждаемся, что receipt НЕ указан в payment_data
+        if "receipt" in payment_data:
+            logging.warning(f"⚠️ ВНИМАНИЕ: receipt найден в payment_data! Удаляем его.")
+            del payment_data["receipt"]
+            logging.info(f"🔍 Payment data после удаления receipt:\n{json.dumps(payment_data, ensure_ascii=False, indent=2)}")
+        
+        try:
+            payment = Payment.create(payment_data, idempotence_key)
+        except ValueError as ve:
+            # Если ошибка связана с receipt, логируем подробности
+            if "receipt" in str(ve).lower() or "customer" in str(ve).lower():
+                logging.error(f"❌ Ошибка валидации receipt/customer. Payment data: {payment_data_str}")
+                logging.error(f"❌ Возможно, библиотека yookassa автоматически добавляет receipt. Проверьте настройки ЮKassa.")
+            raise
         
         payment_id = payment.id
         confirmation_url = payment.confirmation.confirmation_url

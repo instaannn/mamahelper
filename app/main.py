@@ -913,13 +913,19 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 bot_info = await context.bot.get_me()
                 bot_username = bot_info.username if bot_info else None
                 
+                # Получаем номер телефона пользователя, если доступен
+                customer_phone = None
+                if query.from_user.phone_number:
+                    customer_phone = query.from_user.phone_number
+                
                 payment_result = await create_payment(
                     user_id=user_id,
                     amount=amount,
                     description=description,
                     subscription_type=subscription_type,
                     subscription_days=subscription_days,
-                    bot_username=bot_username
+                    bot_username=bot_username,
+                    customer_phone=customer_phone
                 )
                 
                 if payment_result:
@@ -1038,13 +1044,19 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
                 bot_info = await context.bot.get_me()
                 bot_username = bot_info.username if bot_info else None
                 
+                # Получаем номер телефона пользователя, если доступен
+                customer_phone = None
+                if query.from_user.phone_number:
+                    customer_phone = query.from_user.phone_number
+                
                 payment_result = await create_payment(
                     user_id=user_id,
                     amount=amount,
                     description=description,
                     subscription_type=subscription_type,
                     subscription_days=subscription_days,
-                    bot_username=bot_username
+                    bot_username=bot_username,
+                    customer_phone=customer_phone
                 )
                 
                 if payment_result:
