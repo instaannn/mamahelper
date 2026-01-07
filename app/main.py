@@ -24,9 +24,11 @@ from app.storage import (
     has_notification_been_sent, mark_notification_sent,
     save_payment, complete_payment,
     track_user_interaction, get_bot_statistics,
-    disable_expired_premium_subscriptions, DB_PATH
+    disable_expired_premium_subscriptions, DB_PATH, mark_payment_notification_sent
 )
 from app.utils import is_premium_user
+from app.payments import create_payment, is_yookassa_configured, get_payment_status, check_pending_payments
+from app.storage import complete_yookassa_payment, mark_payment_notification_sent, mark_payment_notification_sent
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -96,6 +98,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         user_id = update.effective_user.id if update.effective_user else "unknown"
+        
+        # Проверяем, есть ли параметр в команде /start (например, /start payment_success)
+        command_args = update.message.text.split() if update.message.text else []
+        if len(command_args) > 1 and command_args[1] == "payment_success":
+            # Пользователь вернулся после оплаты
+            logging.info(f"💰 Пользователь {user_id} вернулся после оплаты")
+            # Проверяем статус платежей немедленно
+            if is_yookassa_configured():
+                try:
+                    await check_yookassa_payments_status(context)
+                except Exception as e:
+                    logging.error(f"❌ Ошибка при проверке платежей: {e}", exc_info=True)
+            # Продолжаем выполнение обычного /start
+        
         logging.info(f"🚀 [START] Начало обработки команды /start для user {user_id}")
         
         # Показываем индикатор печати (не блокируем при ошибке)
@@ -282,15 +298,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from telegram.error import TimedOut
             if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
                 logging.warning(f"⚠️ Таймаут при отправке сообщения пользователю {update.effective_user.id}, но сообщение может быть доставлено")
-                # Пробуем отправить простое сообщение
-                try:
-                    await asyncio.wait_for(
-                        update.message.reply_text("Привет! 👋 Используйте кнопки ниже для работы с ботом.", reply_markup=reply_markup),
-                        timeout=5.0
-                    )
-                    logging.info(f"✅ Отправлено упрощенное сообщение для user {user_id}")
-                except Exception:
-                    logging.error(f"❌ Не удалось отправить даже упрощенное сообщение для user {user_id}")
+                # НЕ отправляем упрощенное сообщение - основное может быть доставлено
+                # Просто логируем и продолжаем
             else:
                 # Для других ошибок пробрасываем дальше
                 raise
@@ -336,8 +345,8 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # Создаем кнопки для покупки премиум
         premium_keyboard = [
-            [InlineKeyboardButton("🌟 1 месяц - 5₽ (тест)", callback_data="premium_buy_1month")],
-            [InlineKeyboardButton("🌟 3 месяца - 15₽ (тест)", callback_data="premium_buy_3months")],
+            [InlineKeyboardButton("🌟 1 месяц - 99₽", callback_data="premium_buy_1month")],
+            [InlineKeyboardButton("🌟 3 месяца - 270₽", callback_data="premium_buy_3months")],
             [InlineKeyboardButton("❤️ Поддержать проект", callback_data="premium_support")],
             [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
         ]
@@ -876,7 +885,7 @@ async def handle_dose_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(diary_text, parse_mode="Markdown", reply_markup=diary_keyboard)
 
 async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок покупки премиум - отправка инвойсов."""
+    """Обработчик кнопок покупки премиум - отправка инвойсов через ЮKassa или Telegram Payments."""
     query = update.callback_query
     
     # Пытаемся показать индикатор загрузки, но не блокируем выполнение при ошибке
@@ -890,7 +899,10 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
             logging.warning(f"⚠️ Ошибка при answer callback query для user {query.from_user.id}: {answer_error}")
         # Продолжаем выполнение - индикатор не критичен
     
-    if not PROVIDER_TOKEN:
+    # Проверяем, настроен ли ЮKassa (приоритет) или Telegram Payments
+    use_yookassa = is_yookassa_configured()
+    
+    if not use_yookassa and not PROVIDER_TOKEN:
         await query.message.reply_text(
             "❌ Платежная система не настроена.\n\n"
             "Обратитесь к администратору бота."
@@ -900,109 +912,253 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
     user_id = query.from_user.id
     
     if query.data == "premium_buy_1month":
-        # Премиум на 1 месяц - 5₽ (тест)
-        payload = f"premium_1month_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
-        prices = [LabeledPrice("Премиум-подписка на 1 месяц", 5 * 100)]  # 5₽ в копейках (тест)
+        # Премиум на 1 месяц - 99₽
+        amount = 99.0
+        subscription_type = "1month"
+        subscription_days = 30
+        title = "🌟 Премиум-подписка на 1 месяц"
+        description = (
+            "Получите доступ ко всем премиум-функциям бота на 1 месяц:\n\n"
+            "• 👶 Профиль ребенка\n"
+            "• 📊 Дневник лекарств\n"
+            "• 🚩 Красные флаги"
+        )
         
-        try:
-            await query.message.reply_invoice(
-                title="🌟 Премиум-подписка на 1 месяц",
-                description="Получите доступ ко всем премиум-функциям бота на 1 месяц:\n\n"
-                            "• 👶 Профиль ребенка\n"
-                            "• 📊 Дневник лекарств\n"
-                            "• 🚩 Красные флаги",
-                payload=payload,
-                provider_token=PROVIDER_TOKEN,
-                currency="RUB",
-                prices=prices,
-                need_name=False,
-                need_phone_number=False,
-                need_email=False,
-                need_shipping_address=False,
-                send_phone_number_to_provider=False,
-                send_email_to_provider=False,
-                is_flexible=False,
-            )
-            # Сохраняем информацию о платеже в БД (amount в копейках)
+        if use_yookassa:
+            # Используем ЮKassa API (поддерживает СБП)
             try:
-                await save_payment(user_id, payload, 5 * 100, "RUB", "1month", 30)  # 5₽ для теста
-                logging.info(f"✅ Платеж сохранен в БД: user_id={user_id}, payload={payload}")
-            except Exception as save_error:
-                logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
-                # Продолжаем - инвойс уже отправлен
-        except Exception as e:
-            from telegram.error import TimedOut, NetworkError
-            error_type = type(e).__name__
-            logging.error(f"❌ Ошибка при отправке инвойса для 1 месяца: {error_type}: {e}", exc_info=True)
-            
-            # Пытаемся отправить сообщение об ошибке
-            try:
-                if isinstance(e, (TimedOut, NetworkError)):
-                    error_msg = (
-                        "⚠️ Проблема с подключением к серверу.\n\n"
-                        "Пожалуйста, попробуйте еще раз через несколько секунд."
+                # Получаем username бота для создания правильного return_url
+                bot_info = await context.bot.get_me()
+                bot_username = bot_info.username if bot_info else None
+                
+                payment_result = await create_payment(
+                    user_id=user_id,
+                    amount=amount,
+                    description=description,
+                    subscription_type=subscription_type,
+                    subscription_days=subscription_days,
+                    bot_username=bot_username
+                )
+                
+                if payment_result:
+                    payment_id = payment_result["payment_id"]
+                    confirmation_url = payment_result["confirmation_url"]
+                    payload = payment_result["payload"]
+                    
+                    # Сохраняем платеж в БД
+                    try:
+                        await save_payment(
+                            user_id=user_id,
+                            invoice_payload=payload,
+                            amount=int(amount * 100),  # в копейках
+                            currency="RUB",
+                            subscription_type=subscription_type,
+                            subscription_days=subscription_days,
+                            yookassa_payment_id=payment_id,
+                            confirmation_url=confirmation_url
+                        )
+                        logging.info(f"✅ Платеж ЮKassa сохранен: user_id={user_id}, payment_id={payment_id}")
+                    except Exception as save_error:
+                        logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
+                    
+                    # Отправляем пользователю ссылку на оплату
+                    payment_text = (
+                        f"{title}\n\n"
+                        f"{description}\n\n"
+                        f"💰 Сумма: {amount:.0f}₽\n\n"
+                        f"💳 Для оплаты нажмите кнопку 'Оплатить' ниже.\n\n"
+                        f"💡 После оплаты премиум будет активирован автоматически.\n"
+                        f"📱 После оплаты нажмите кнопку 'Вернуться в бот' или перейдите в бот."
                     )
+                    
+                    payment_keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("💳 Оплатить", url=confirmation_url)],
+                        [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
+                    ])
+                    
+                    await query.message.reply_text(payment_text, reply_markup=payment_keyboard)
                 else:
-                    error_msg = (
-                        "❌ Ошибка при создании счета.\n\n"
-                        "Пожалуйста, попробуйте позже или свяжитесь с поддержкой."
-                    )
-                await query.message.reply_text(error_msg)
-            except Exception as send_error:
-                logging.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
+                    raise Exception("Не удалось создать платеж через ЮKassa")
+                    
+            except Exception as e:
+                logging.error(f"❌ Ошибка при создании платежа через ЮKassa: {e}", exc_info=True)
+                await query.message.reply_text(
+                    "❌ Ошибка при создании платежа.\n\n"
+                    "Пожалуйста, попробуйте позже или свяжитесь с поддержкой."
+                )
+        else:
+            # Используем Telegram Payments (старый способ)
+            payload = f"premium_1month_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
+            prices = [LabeledPrice("Премиум-подписка на 1 месяц", 99 * 100)]  # 99₽ в копейках
+            
+            try:
+                await query.message.reply_invoice(
+                    title=title,
+                    description=description,
+                    payload=payload,
+                    provider_token=PROVIDER_TOKEN,
+                    currency="RUB",
+                    prices=prices,
+                    need_name=False,
+                    need_phone_number=False,
+                    need_email=False,
+                    need_shipping_address=False,
+                    send_phone_number_to_provider=False,
+                    send_email_to_provider=False,
+                    is_flexible=False,
+                )
+                # Сохраняем информацию о платеже в БД (amount в копейках)
+                try:
+                    await save_payment(user_id, payload, 99 * 100, "RUB", "1month", 30)
+                    logging.info(f"✅ Платеж сохранен в БД: user_id={user_id}, payload={payload}")
+                except Exception as save_error:
+                    logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
+                    # Продолжаем - инвойс уже отправлен
+            except Exception as e:
+                from telegram.error import TimedOut, NetworkError
+                error_type = type(e).__name__
+                logging.error(f"❌ Ошибка при отправке инвойса для 1 месяца: {error_type}: {e}", exc_info=True)
+                
+                # Пытаемся отправить сообщение об ошибке
+                try:
+                    if isinstance(e, (TimedOut, NetworkError)):
+                        error_msg = (
+                            "⚠️ Проблема с подключением к серверу.\n\n"
+                            "Пожалуйста, попробуйте еще раз через несколько секунд."
+                        )
+                    else:
+                        error_msg = (
+                            "❌ Ошибка при создании счета.\n\n"
+                            "Пожалуйста, попробуйте позже или свяжитесь с поддержкой."
+                        )
+                    await query.message.reply_text(error_msg)
+                except Exception as send_error:
+                    logging.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
     
     elif query.data == "premium_buy_3months":
-        # Премиум на 3 месяца - 15₽ (тест)
-        payload = f"premium_3months_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
-        prices = [LabeledPrice("Премиум-подписка на 3 месяца", 15 * 100)]  # 15₽ в копейках (тест)
+        # Премиум на 3 месяца - 270₽
+        amount = 270.0
+        subscription_type = "3months"
+        subscription_days = 90
+        title = "🌟 Премиум-подписка на 3 месяца"
+        description = (
+            "Получите доступ ко всем премиум-функциям бота на 3 месяца:\n\n"
+            "• 👶 Профиль ребенка\n"
+            "• 📊 Дневник лекарств\n"
+            "• 🚩 Красные флаги\n\n"
+            "💰 Выгоднее на 9%!"
+        )
         
-        try:
-            await query.message.reply_invoice(
-                title="🌟 Премиум-подписка на 3 месяца",
-                description="Получите доступ ко всем премиум-функциям бота на 3 месяца:\n\n"
-                            "• 👶 Профиль ребенка\n"
-                            "• 📊 Дневник лекарств\n"
-                            "• 🚩 Красные флаги\n\n"
-                            "💰 Выгоднее на 9%!",
-                payload=payload,
-                provider_token=PROVIDER_TOKEN,
-                currency="RUB",
-                prices=prices,
-                need_name=False,
-                need_phone_number=False,
-                need_email=False,
-                need_shipping_address=False,
-                send_phone_number_to_provider=False,
-                send_email_to_provider=False,
-                is_flexible=False,
-            )
-            # Сохраняем информацию о платеже в БД (amount в копейках) - не блокируем при ошибке
+        if use_yookassa:
+            # Используем ЮKassa API (поддерживает СБП)
             try:
-                await save_payment(user_id, payload, 15 * 100, "RUB", "3months", 90)  # 15₽ для теста
-                logging.info(f"✅ Платеж сохранен в БД: user_id={user_id}, payload={payload}")
-            except Exception as save_error:
-                logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
-                # Продолжаем - инвойс уже отправлен
-        except Exception as e:
-            from telegram.error import TimedOut, NetworkError
-            error_type = type(e).__name__
-            logging.error(f"❌ Ошибка при отправке инвойса для 3 месяцев: {error_type}: {e}", exc_info=True)
-            
-            # Пытаемся отправить сообщение об ошибке
-            try:
-                if isinstance(e, (TimedOut, NetworkError)):
-                    error_msg = (
-                        "⚠️ Проблема с подключением к серверу.\n\n"
-                        "Пожалуйста, попробуйте еще раз через несколько секунд."
+                # Получаем username бота для создания правильного return_url
+                bot_info = await context.bot.get_me()
+                bot_username = bot_info.username if bot_info else None
+                
+                payment_result = await create_payment(
+                    user_id=user_id,
+                    amount=amount,
+                    description=description,
+                    subscription_type=subscription_type,
+                    subscription_days=subscription_days,
+                    bot_username=bot_username
+                )
+                
+                if payment_result:
+                    payment_id = payment_result["payment_id"]
+                    confirmation_url = payment_result["confirmation_url"]
+                    payload = payment_result["payload"]
+                    
+                    # Сохраняем платеж в БД
+                    try:
+                        await save_payment(
+                            user_id=user_id,
+                            invoice_payload=payload,
+                            amount=int(amount * 100),  # в копейках
+                            currency="RUB",
+                            subscription_type=subscription_type,
+                            subscription_days=subscription_days,
+                            yookassa_payment_id=payment_id,
+                            confirmation_url=confirmation_url
+                        )
+                        logging.info(f"✅ Платеж ЮKassa сохранен: user_id={user_id}, payment_id={payment_id}")
+                    except Exception as save_error:
+                        logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
+                    
+                    # Отправляем пользователю ссылку на оплату
+                    payment_text = (
+                        f"{title}\n\n"
+                        f"{description}\n\n"
+                        f"💰 Сумма: {amount:.0f}₽\n\n"
+                        f"💳 Для оплаты нажмите кнопку 'Оплатить' ниже.\n\n"
+                        f"💡 После оплаты премиум будет активирован автоматически.\n"
+                        f"📱 После оплаты нажмите кнопку 'Вернуться в бот' или перейдите в бот."
                     )
+                    
+                    payment_keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("💳 Оплатить", url=confirmation_url)],
+                        [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
+                    ])
+                    
+                    await query.message.reply_text(payment_text, reply_markup=payment_keyboard)
                 else:
-                    error_msg = (
-                        "❌ Ошибка при создании счета.\n\n"
-                        "Пожалуйста, попробуйте позже или свяжитесь с поддержкой."
-                    )
-                await query.message.reply_text(error_msg)
-            except Exception as send_error:
-                logging.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
+                    raise Exception("Не удалось создать платеж через ЮKassa")
+                    
+            except Exception as e:
+                logging.error(f"❌ Ошибка при создании платежа через ЮKassa: {e}", exc_info=True)
+                await query.message.reply_text(
+                    "❌ Ошибка при создании платежа.\n\n"
+                    "Пожалуйста, попробуйте позже или свяжитесь с поддержкой."
+                )
+        else:
+            # Используем Telegram Payments (старый способ)
+            payload = f"premium_3months_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
+            prices = [LabeledPrice("Премиум-подписка на 3 месяца", 270 * 100)]  # 270₽ в копейках
+            
+            try:
+                await query.message.reply_invoice(
+                    title=title,
+                    description=description,
+                    payload=payload,
+                    provider_token=PROVIDER_TOKEN,
+                    currency="RUB",
+                    prices=prices,
+                    need_name=False,
+                    need_phone_number=False,
+                    need_email=False,
+                    need_shipping_address=False,
+                    send_phone_number_to_provider=False,
+                    send_email_to_provider=False,
+                    is_flexible=False,
+                )
+                # Сохраняем информацию о платеже в БД (amount в копейках) - не блокируем при ошибке
+                try:
+                    await save_payment(user_id, payload, 270 * 100, "RUB", "3months", 90)
+                    logging.info(f"✅ Платеж сохранен в БД: user_id={user_id}, payload={payload}")
+                except Exception as save_error:
+                    logging.error(f"❌ Ошибка при сохранении платежа: {save_error}", exc_info=True)
+                    # Продолжаем - инвойс уже отправлен
+            except Exception as e:
+                from telegram.error import TimedOut, NetworkError
+                error_type = type(e).__name__
+                logging.error(f"❌ Ошибка при отправке инвойса для 3 месяцев: {error_type}: {e}", exc_info=True)
+                
+                # Пытаемся отправить сообщение об ошибке
+                try:
+                    if isinstance(e, (TimedOut, NetworkError)):
+                        error_msg = (
+                            "⚠️ Проблема с подключением к серверу.\n\n"
+                            "Пожалуйста, попробуйте еще раз через несколько секунд."
+                        )
+                    else:
+                        error_msg = (
+                            "❌ Ошибка при создании счета.\n\n"
+                            "Пожалуйста, попробуйте позже или свяжитесь с поддержкой."
+                        )
+                    await query.message.reply_text(error_msg)
+                except Exception as send_error:
+                    logging.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
     
     elif query.data == "premium_support":
         await query.message.reply_text(
@@ -1265,8 +1421,8 @@ async def send_premium_expiry_notification(context: ContextTypes.DEFAULT_TYPE, u
         
         # Создаем кнопки для продления
         premium_keyboard = [
-            [InlineKeyboardButton("🌟 1 месяц - 5₽ (тест)", callback_data="premium_buy_1month")],
-            [InlineKeyboardButton("🌟 3 месяца - 15₽ (тест)", callback_data="premium_buy_3months")],
+            [InlineKeyboardButton("🌟 1 месяц - 99₽", callback_data="premium_buy_1month")],
+            [InlineKeyboardButton("🌟 3 месяца - 270₽", callback_data="premium_buy_3months")],
             [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
         ]
         premium_markup = InlineKeyboardMarkup(premium_keyboard)
@@ -1304,8 +1460,8 @@ async def send_premium_expired_notification(context: ContextTypes.DEFAULT_TYPE, 
         
         # Создаем кнопки для продления
         premium_keyboard = [
-            [InlineKeyboardButton("🌟 1 месяц - 5₽ (тест)", callback_data="premium_buy_1month")],
-            [InlineKeyboardButton("🌟 3 месяца - 15₽ (тест)", callback_data="premium_buy_3months")],
+            [InlineKeyboardButton("🌟 1 месяц - 99₽", callback_data="premium_buy_1month")],
+            [InlineKeyboardButton("🌟 3 месяца - 270₽", callback_data="premium_buy_3months")],
             [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
         ]
         premium_markup = InlineKeyboardMarkup(premium_keyboard)
@@ -1394,6 +1550,115 @@ async def disable_expired_subscriptions_task(context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logging.error(f"❌ Ошибка при отключении истекших подписок: {e}", exc_info=True)
 
+
+async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Периодическая задача для проверки статуса pending платежей через ЮKassa.
+    Если платеж успешно оплачен, активирует премиум.
+    """
+    if not is_yookassa_configured():
+        return  # ЮKassa не настроен, пропускаем проверку
+    
+    try:
+        # Получаем список pending платежей
+        pending_payments = await check_pending_payments()
+        
+        if not pending_payments:
+            return  # Нет pending платежей
+        
+        logging.info(f"🔍 Проверка статуса {len(pending_payments)} pending платежей через ЮKassa...")
+        
+        for payment_info in pending_payments:
+            payment_id = payment_info["payment_id"]
+            user_id = payment_info["user_id"]
+            
+            try:
+                # Получаем статус платежа из ЮKassa
+                payment_status = await get_payment_status(payment_id)
+                
+                if not payment_status:
+                    continue  # Не удалось получить статус, пропускаем
+                
+                status = payment_status.get("status")
+                
+                if status == "succeeded":
+                    # Платеж успешно оплачен - активируем премиум
+                    logging.info(f"✅ Платеж {payment_id} успешно оплачен, активируем премиум для user_id={user_id}")
+                    
+                    result = await complete_yookassa_payment(payment_id)
+                    
+                    if result:
+                        # Отправляем уведомление пользователю
+                        premium_until = result["premium_until"]
+                        subscription_days = result["subscription_days"]
+                        
+                        # Форматируем дату окончания для отображения
+                        moscow_tz = timezone(timedelta(hours=3))
+                        until_local = premium_until.astimezone(moscow_tz)
+                        until_str = until_local.strftime("%d.%m.%Y")
+                        
+                        success_text = (
+                            f"✅ **Платеж успешно обработан!**\n\n"
+                            f"✨ Ваша премиум-подписка активирована на {subscription_days} дней!\n\n"
+                            f"📅 Подписка действует до: {until_str}\n\n"
+                            f"Теперь вам доступны все премиум-функции:\n"
+                            f"• 👶 Профиль ребенка\n"
+                            f"• 📊 Дневник лекарств\n"
+                            f"• 🚩 Красные флаги\n\n"
+                            f"Спасибо за поддержку! 💚"
+                        )
+                        
+                        # Добавляем кнопку "На главную"
+                        home_keyboard = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
+                        ])
+                        
+                        try:
+                            # Проверяем, не было ли уже отправлено уведомление для этого платежа
+                            # (защита от дублирования при одновременной обработке)
+                            import aiosqlite
+                            async with aiosqlite.connect(DB_PATH) as check_db:
+                                check_db.row_factory = aiosqlite.Row
+                                async with check_db.execute("""
+                                    SELECT notification_sent_at FROM payments
+                                    WHERE yookassa_payment_id = ?
+                                """, (payment_id,)) as check_cursor:
+                                    check_row = await check_cursor.fetchone()
+                                    if check_row and check_row.get("notification_sent_at"):
+                                        logging.info(f"ℹ️ Уведомление для платежа {payment_id} уже было отправлено ранее, пропускаем")
+                                        continue  # Пропускаем отправку, если уже отправлено
+                            
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=success_text,
+                                parse_mode="Markdown",
+                                reply_markup=home_keyboard
+                            )
+                            logging.info(f"✅ Уведомление об активации премиума отправлено user_id={user_id}")
+                            
+                            # Отмечаем, что уведомление отправлено (атомарно, чтобы избежать дублирования)
+                            await mark_payment_notification_sent(payment_id)
+                        except Exception as send_error:
+                            logging.error(f"❌ Не удалось отправить уведомление user_id={user_id}: {send_error}")
+                    else:
+                        logging.warning(f"⚠️ Не удалось активировать премиум для платежа {payment_id}")
+                
+                elif status == "canceled":
+                    logging.info(f"ℹ️ Платеж {payment_id} отменен")
+                    # Можно обновить статус в БД, но не обязательно
+                
+                # Небольшая задержка между проверками, чтобы не перегружать API
+                await asyncio.sleep(0.5)
+                
+            except Exception as payment_error:
+                logging.error(f"❌ Ошибка при проверке платежа {payment_id}: {payment_error}", exc_info=True)
+                continue
+        
+        logging.info(f"✅ Проверка статуса платежей завершена")
+        
+    except Exception as e:
+        logging.error(f"❌ Ошибка при проверке статуса платежей ЮKassa: {e}", exc_info=True)
+
 async def post_init(application: Application) -> None:
     """Инициализация БД при старте приложения."""
     await init_db()
@@ -1428,6 +1693,16 @@ async def post_init(application: Application) -> None:
             name="disable_expired_premium"
         )
         logging.info("✅ Периодическая задача для отключения истекших премиум подписок настроена (ежедневно в 00:00 UTC)")
+        
+        # Запускаем периодическую проверку статуса платежей ЮKassa (каждые 5 минут)
+        if is_yookassa_configured():
+            job_queue.run_repeating(
+                check_yookassa_payments_status,
+                interval=300,  # 5 минут
+                first=60,  # Первый запуск через 1 минуту после старта
+                name="yookassa_payments_check"
+            )
+            logging.info("✅ Периодическая проверка статуса платежей ЮKassa настроена (каждые 5 минут)")
     
     # Явно очищаем webhook перед запуском polling с несколькими попытками
     max_attempts = 3
@@ -1613,7 +1888,12 @@ def main():
                         f"Спасибо за поддержку! 💚"
                     )
                     
-                    await update.message.reply_text(success_text, parse_mode="Markdown")
+                    # Добавляем кнопку "На главную"
+                    home_keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
+                    ])
+                    
+                    await update.message.reply_text(success_text, parse_mode="Markdown", reply_markup=home_keyboard)
                     logging.info(f"✅ Премиум активирован для пользователя {user_id} до {until_str}")
                     return  # Успешно обработано, выходим из функции
                 else:

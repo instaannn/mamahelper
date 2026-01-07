@@ -46,7 +46,8 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Изменить профиль", callback_data=f"profile_edit_{profile.profile_id}")],
             [InlineKeyboardButton("🗑 Удалить профиль", callback_data=f"profile_delete_{profile.profile_id}")],
-            [InlineKeyboardButton("➕ Добавить еще одного ребенка", callback_data="start_create_profile")]
+            [InlineKeyboardButton("➕ Добавить еще одного ребенка", callback_data="start_create_profile")],
+            [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
         ])
         
         await update.message.reply_text("\n".join(lines), reply_markup=kb)
@@ -74,6 +75,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         
         buttons.append([InlineKeyboardButton("➕ Добавить еще одного ребенка", callback_data="start_create_profile")])
+        buttons.append([InlineKeyboardButton("🏠 На главную", callback_data="start_home")])
         
         kb = InlineKeyboardMarkup(buttons)
         await update.message.reply_text("\n".join(lines), reply_markup=kb)

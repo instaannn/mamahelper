@@ -267,7 +267,6 @@ async def init_db() -> None:
                 await db.commit()
         except Exception as e:
             # Ошибка миграции - логируем, но продолжаем работу
-            import logging
             logging.warning(f"Migration error (may be expected): {e}")
             pass
         
@@ -366,6 +365,33 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_premium_notifications_user_until 
             ON premium_expiry_notifications(user_id, premium_until)
         """)
+        
+        # Миграция: добавляем поля для ЮKassa (если их еще нет)
+        try:
+            # Проверяем, есть ли колонка yookassa_payment_id
+            async with db.execute("PRAGMA table_info(payments)") as cursor:
+                columns = await cursor.fetchall()
+                has_yookassa_id = any(col[1] == "yookassa_payment_id" for col in columns)
+                has_confirmation_url = any(col[1] == "confirmation_url" for col in columns)
+            
+            if not has_yookassa_id:
+                await db.execute("ALTER TABLE payments ADD COLUMN yookassa_payment_id TEXT")
+                logging.info("✅ Добавлена колонка yookassa_payment_id в таблицу payments")
+            
+            if not has_confirmation_url:
+                await db.execute("ALTER TABLE payments ADD COLUMN confirmation_url TEXT")
+                logging.info("✅ Добавлена колонка confirmation_url в таблицу payments")
+            
+            # Проверяем, есть ли колонка notification_sent_at
+            has_notification_sent = any(col[1] == "notification_sent_at" for col in columns)
+            if not has_notification_sent:
+                await db.execute("ALTER TABLE payments ADD COLUMN notification_sent_at TEXT")
+                logging.info("✅ Добавлена колонка notification_sent_at в таблицу payments")
+            
+            await db.commit()
+        except Exception as e:
+            logging.warning(f"⚠️ Ошибка при миграции таблицы payments: {e}")
+            # Продолжаем работу даже если миграция не удалась
         
         await db.commit()
     finally:
@@ -946,11 +972,13 @@ async def save_payment(
     amount: int,
     currency: str,
     subscription_type: str,
-    subscription_days: int
+    subscription_days: int,
+    yookassa_payment_id: Optional[str] = None,
+    confirmation_url: Optional[str] = None
 ) -> None:
     """
     Сохранить информацию о платеже в БД.
-    Вызывается при создании инвойса (счета на оплату).
+    Вызывается при создании инвойса (счета на оплату) или платежа через ЮKassa.
     
     Args:
         user_id: ID пользователя
@@ -959,6 +987,8 @@ async def save_payment(
         currency: Валюта (например, "RUB")
         subscription_type: Тип подписки (например, "1month", "3months")
         subscription_days: Количество дней подписки (30 или 90)
+        yookassa_payment_id: ID платежа в ЮKassa (опционально)
+        confirmation_url: URL для подтверждения платежа (опционально)
     """
     now = datetime.now(timezone.utc)
     
@@ -966,8 +996,9 @@ async def save_payment(
         try:
             await db.execute("""
                 INSERT INTO payments
-                (user_id, invoice_payload, amount, currency, subscription_type, subscription_days, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                (user_id, invoice_payload, amount, currency, subscription_type, subscription_days, 
+                 status, created_at, yookassa_payment_id, confirmation_url)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
             """, (
                 user_id,
                 invoice_payload,
@@ -975,11 +1006,16 @@ async def save_payment(
                 currency,
                 subscription_type,
                 subscription_days,
-                now.isoformat()
+                now.isoformat(),
+                yookassa_payment_id,
+                confirmation_url
             ))
             await db.commit()
             import logging
-            logging.info(f"✅ Платеж сохранен: user_id={user_id}, payload={invoice_payload}, amount={amount} {currency}")
+            logging.info(
+                f"✅ Платеж сохранен: user_id={user_id}, payload={invoice_payload}, "
+                f"amount={amount} {currency}, yookassa_id={yookassa_payment_id}"
+            )
         except Exception as e:
             import logging
             logging.error(f"❌ Ошибка при сохранении платежа в БД: {e}", exc_info=True)
@@ -1062,10 +1098,10 @@ async def complete_payment(
                             # Определяем тип подписки из payload
                             if '1month' in invoice_payload:
                                 subscription_days = 30
-                                amount = 5  # 5₽ для теста
+                                amount = 99
                             elif '3months' in invoice_payload:
                                 subscription_days = 90
-                                amount = 15  # 15₽ для теста
+                                amount = 270
                             else:
                                 logging.error(f"❌ Не удалось определить тип подписки из payload: {invoice_payload}")
                                 return None
@@ -1228,6 +1264,175 @@ async def complete_payment(
     # Если все попытки исчерпаны
     logging.error(f"❌ Не удалось обработать платеж '{invoice_payload}' после {MAX_RETRIES} попыток")
     return None
+
+
+async def complete_yookassa_payment(
+    yookassa_payment_id: str
+) -> Optional[dict]:
+    """
+    Завершить платеж по payment_id от ЮKassa и активировать премиум-подписку.
+    Вызывается после успешной оплаты через ЮKassa (из webhook или при проверке статуса).
+    
+    Args:
+        yookassa_payment_id: ID платежа в ЮKassa
+    
+    Returns:
+        Словарь с информацией о платеже и подписке, или None если платеж не найден
+    """
+    now = datetime.now(timezone.utc)
+    
+    # Используем retry логику для всех операций
+    for attempt in range(MAX_RETRIES):
+        db = None
+        try:
+            db = await _db_connect_with_retry()
+            db.row_factory = aiosqlite.Row
+            
+            # Ищем платеж по yookassa_payment_id
+            async with db.execute("""
+                SELECT user_id, subscription_days, status, invoice_payload, notification_sent_at
+                FROM payments
+                WHERE yookassa_payment_id = ? AND status = 'pending'
+            """, (yookassa_payment_id,)) as cursor:
+                row = await cursor.fetchone()
+            
+            if not row:
+                logging.warning(f"⚠️ Платеж с yookassa_payment_id '{yookassa_payment_id}' не найден со статусом 'pending'")
+                # Проверяем, может быть платеж уже обработан
+                async with db.execute("""
+                    SELECT user_id, subscription_days, status, notification_sent_at
+                    FROM payments
+                    WHERE yookassa_payment_id = ?
+                """, (yookassa_payment_id,)) as cursor2:
+                    row2 = await cursor2.fetchone()
+                    if row2:
+                        notification_sent = row2.get("notification_sent_at") if row2 else None
+                        if notification_sent:
+                            logging.info(f"ℹ️ Платеж с yookassa_payment_id '{yookassa_payment_id}' уже обработан и уведомление отправлено")
+                        else:
+                            logging.info(f"ℹ️ Платеж с yookassa_payment_id '{yookassa_payment_id}' уже обработан (статус: {row2['status']}), но уведомление не отправлено")
+                        # Возвращаем None, чтобы не отправлять уведомление повторно
+                        return None
+                    else:
+                        logging.error(f"❌ Платеж с yookassa_payment_id '{yookassa_payment_id}' не найден в БД")
+                        return None
+            
+            user_id = row["user_id"]
+            subscription_days = row["subscription_days"]
+            invoice_payload = row["invoice_payload"]
+            notification_sent_at = row.get("notification_sent_at") if row else None
+            
+            # Проверяем, было ли уже отправлено уведомление
+            if notification_sent_at:
+                logging.info(f"ℹ️ Уведомление для платежа {yookassa_payment_id} уже было отправлено ранее")
+                return None  # Не отправляем уведомление повторно
+            
+            # Обновляем статус платежа на 'completed' (но НЕ устанавливаем notification_sent_at пока)
+            # notification_sent_at будет установлен после успешной отправки уведомления
+            await db.execute("""
+                UPDATE payments
+                SET status = 'completed', completed_at = ?, provider_payment_charge_id = ?
+                WHERE yookassa_payment_id = ?
+            """, (now.isoformat(), yookassa_payment_id, yookassa_payment_id))
+            await db.commit()
+            
+            # Активируем или продлеваем премиум
+            async with db.execute("""
+                SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?
+            """, (user_id,)) as premium_cursor:
+                premium_row = await premium_cursor.fetchone()
+            
+            if premium_row and premium_row["premium_until"]:
+                # Продлеваем существующий премиум
+                current_until = datetime.fromisoformat(premium_row["premium_until"])
+                if current_until > now:
+                    # Премиум еще активен - продлеваем от текущей даты окончания
+                    new_until = current_until + timedelta(days=subscription_days)
+                else:
+                    # Премиум истек - начинаем с сегодня
+                    new_until = now + timedelta(days=subscription_days)
+            else:
+                # Премиум не был активен - начинаем с сегодня
+                new_until = now + timedelta(days=subscription_days)
+            
+            # Обновляем или создаем запись о премиум
+            await db.execute("""
+                INSERT OR REPLACE INTO user_premium
+                (user_id, is_premium, premium_until, created_at, updated_at)
+                VALUES (?, 1, ?, 
+                    COALESCE((SELECT created_at FROM user_premium WHERE user_id = ?), ?),
+                    ?)
+            """, (user_id, new_until.isoformat(), user_id, now.isoformat(), now.isoformat()))
+            await db.commit()
+            
+            logging.info(
+                f"✅ Премиум активирован для user_id={user_id} до {new_until.isoformat()} "
+                f"(платеж: {yookassa_payment_id})"
+            )
+            
+            return {
+                "user_id": user_id,
+                "subscription_days": subscription_days,
+                "premium_until": new_until,
+                "payment_id": yookassa_payment_id
+            }
+            
+        except aiosqlite.OperationalError as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)
+                logging.warning(f"⚠️ БД заблокирована при обработке платежа '{yookassa_payment_id}', попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logging.error(f"❌ Ошибка БД при обработке платежа '{yookassa_payment_id}': {e}")
+                raise
+        except Exception as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            logging.error(f"❌ Ошибка при обработке платежа '{yookassa_payment_id}': {e}", exc_info=True)
+            return None
+    
+    return None
+
+
+async def mark_payment_notification_sent(yookassa_payment_id: str) -> None:
+    """
+    Отметить, что уведомление об успешной оплате было отправлено пользователю.
+    
+    Args:
+        yookassa_payment_id: ID платежа в ЮKassa
+    """
+    now = datetime.now(timezone.utc)
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with _db_connect_with_retry() as db:
+                await db.execute("""
+                    UPDATE payments
+                    SET notification_sent_at = ?
+                    WHERE yookassa_payment_id = ? AND notification_sent_at IS NULL
+                """, (now.isoformat(), yookassa_payment_id))
+                await db.commit()
+                logging.info(f"✅ Отмечено, что уведомление отправлено для платежа {yookassa_payment_id}")
+                return
+        except aiosqlite.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logging.error(f"❌ Ошибка при отметке отправки уведомления для платежа {yookassa_payment_id}: {e}")
+                return
+        except Exception as e:
+            logging.error(f"❌ Ошибка при отметке отправки уведомления для платежа {yookassa_payment_id}: {e}", exc_info=True)
+            return
 
 # ---------- Уведомления о истечении премиума ----------
 async def get_users_with_expiring_premium(min_days: int = 3, max_days: int = 5) -> List[tuple]:
