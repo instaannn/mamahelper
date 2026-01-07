@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta, time as dt_time
 
-from telegram import Update, LabeledPrice, ChatAction
+from telegram import Update, LabeledPrice
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters, PreCheckoutQueryHandler
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -103,7 +103,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.debug(f"📝 [START] Показываем индикатор печати для user {user_id}")
             await context.bot.send_chat_action(
                 chat_id=update.effective_chat.id,
-                action=ChatAction.TYPING
+                action="typing"
             )
             logging.debug(f"✅ [START] Индикатор печати показан для user {user_id}")
         except Exception as action_error:
