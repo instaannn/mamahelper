@@ -1129,10 +1129,64 @@ async def complete_payment(
                 # Нет активной подписки - начинаем с сегодня
                 new_until = now + timedelta(days=subscription_days)
                 
-            # Устанавливаем премиум-статус (эта функция сама управляет подключением)
-            await set_user_premium(user_id, True, new_until)
+            # Устанавливаем премиум-статус напрямую в текущем подключении (избегаем блокировок)
+            # Проверяем, есть ли уже запись
+            async with db.execute(
+                "SELECT user_id FROM user_premium WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                existing = await cursor.fetchone()
+            
+            now = datetime.now(timezone.utc)
+            if existing:
+                # Обновляем существующую запись
+                await db.execute("""
+                    UPDATE user_premium
+                    SET is_premium = ?,
+                        premium_until = ?,
+                        updated_at = ?
+                    WHERE user_id = ?
+                """, (
+                    1,  # is_premium = True
+                    new_until.isoformat(),
+                    now.isoformat(),
+                    user_id,
+                ))
+            else:
+                # Создаем новую запись
+                await db.execute("""
+                    INSERT INTO user_premium
+                    (user_id, is_premium, premium_until, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    user_id,
+                    1,  # is_premium = True
+                    new_until.isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                ))
             
             await db.commit()
+            
+            # Проверяем, что данные действительно сохранились
+            async with db.execute(
+                "SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?",
+                (user_id,)
+            ) as verify_cursor:
+                verify_row = await verify_cursor.fetchone()
+                if verify_row:
+                    saved_is_premium = bool(int(verify_row["is_premium"])) if verify_row["is_premium"] is not None else False
+                    saved_premium_until = verify_row["premium_until"]
+                    logging.info(
+                        f"✅ Премиум сохранен для user_id={user_id}: "
+                        f"is_premium={saved_is_premium}, premium_until={saved_premium_until}"
+                    )
+                    if not saved_is_premium:
+                        logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не сохранился для user_id={user_id}!")
+                        raise ValueError(f"Премиум не сохранился в БД для user_id={user_id}")
+                else:
+                    logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Запись о премиум не найдена после сохранения для user_id={user_id}!")
+                    raise ValueError(f"Запись о премиум не найдена после сохранения для user_id={user_id}")
             
             # Закрываем соединение перед возвратом
             await db.close()
