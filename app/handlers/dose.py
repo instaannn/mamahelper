@@ -332,7 +332,29 @@ async def calculate_suppository_dose(update: Update, context: ContextTypes.DEFAU
             "на фоне прививок, которые проводятся в возрасте 2 месяцев.\n\n"
             "Препарат применяется только по назначению врача!"
         )
-        await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+        # Отправляем с обработкой таймаутов
+        import asyncio
+        try:
+            await asyncio.wait_for(
+                update.message.reply_text(text, reply_markup=ReplyKeyboardRemove()),
+                timeout=10.0
+            )
+        except (asyncio.TimeoutError, Exception) as send_error:
+            from telegram.error import TimedOut
+            if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
+                # Пробуем отправить упрощенное сообщение
+                try:
+                    await asyncio.wait_for(
+                        update.message.reply_text(
+                            "⚠️ Препарат применяется только по назначению врача!",
+                            reply_markup=ReplyKeyboardRemove()
+                        ),
+                        timeout=5.0
+                    )
+                except Exception:
+                    pass
+            else:
+                raise
         return ConversationHandler.END
     
     # Определяем дозировку по весу
@@ -362,18 +384,42 @@ async def calculate_suppository_dose(update: Update, context: ContextTypes.DEFAU
         supp_count = 2
     else:
         # Вес вне диапазона
-        if weight < 4:
-            await update.message.reply_text(
-                "⚠️ Для детей с весом менее 4 кг применение препарата возможно только "
-                "по назначению врача. Пожалуйста, обратитесь к педиатру ❤️‍🩹",
-                reply_markup=ReplyKeyboardRemove()
-            )
-        else:
-            await update.message.reply_text(
-                "⚠️ Для детей с весом более 35 кг рекомендуется консультация с педиатром "
-                "для подбора дозировки. ❤️‍🩹",
-                reply_markup=ReplyKeyboardRemove()
-            )
+        import asyncio
+        try:
+            if weight < 4:
+                await asyncio.wait_for(
+                    update.message.reply_text(
+                        "⚠️ Для детей с весом менее 4 кг применение препарата возможно только "
+                        "по назначению врача. Пожалуйста, обратитесь к педиатру ❤️‍🩹",
+                        reply_markup=ReplyKeyboardRemove()
+                    ),
+                    timeout=10.0
+                )
+            else:
+                await asyncio.wait_for(
+                    update.message.reply_text(
+                        "⚠️ Для детей с весом более 35 кг рекомендуется консультация с педиатром "
+                        "для подбора дозировки. ❤️‍🩹",
+                        reply_markup=ReplyKeyboardRemove()
+                    ),
+                    timeout=10.0
+                )
+        except (asyncio.TimeoutError, Exception) as send_error:
+            from telegram.error import TimedOut
+            if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
+                # Пробуем отправить упрощенное сообщение
+                try:
+                    await asyncio.wait_for(
+                        update.message.reply_text(
+                            "⚠️ Пожалуйста, обратитесь к педиатру",
+                            reply_markup=ReplyKeyboardRemove()
+                        ),
+                        timeout=5.0
+                    )
+                except Exception:
+                    pass
+            else:
+                raise
         return ConversationHandler.END
     
     # Формируем финальное сообщение
@@ -455,7 +501,40 @@ async def calculate_suppository_dose(update: Update, context: ContextTypes.DEFAU
     
     kb = InlineKeyboardMarkup(buttons)
     
-    await update.message.reply_text(full_text, reply_markup=kb)
+    # Отправляем сообщение с обработкой таймаутов
+    import asyncio
+    try:
+        await asyncio.wait_for(
+            update.message.reply_text(full_text, reply_markup=kb),
+            timeout=10.0
+        )
+    except (asyncio.TimeoutError, Exception) as send_error:
+        from telegram.error import TimedOut
+        if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
+            # Пробуем отправить упрощенное сообщение
+            try:
+                simple_text = (
+                    f"🔶 Рекомендуемая доза: {dose_text}\n\n"
+                    f"Вес: {weight} кг\n"
+                    f"Возрастная группа: {age_group}\n\n"
+                    f"Интервал: не менее 6 часов"
+                )
+                await asyncio.wait_for(
+                    update.message.reply_text(simple_text, reply_markup=kb),
+                    timeout=5.0
+                )
+            except Exception:
+                # Если и это не получилось, отправляем минимальное сообщение
+                try:
+                    await update.message.reply_text(
+                        f"Доза: {dose_text}",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                except Exception:
+                    pass  # Не критично, пользователь может попробовать еще раз
+        else:
+            raise
+    
     return ConversationHandler.END
 
 async def calculate_and_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):

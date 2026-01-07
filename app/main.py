@@ -1630,16 +1630,19 @@ def main():
                     f"Payload: {payment.invoice_payload if 'payment' in locals() else 'unknown'}",
                     exc_info=True
                 )
-                error_msg = (
-                    f"❌ Произошла ошибка при активации премиума.\n\n"
-                    f"**Не волнуйтесь!** Ваши деньги в безопасности.\n\n"
-                    f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
-                    f"• Ваш user_id: {user_id if 'user_id' in locals() else 'неизвестен'}\n"
-                    f"• Payload: {payment.invoice_payload if 'payment' in locals() else 'неизвестен'}\n\n"
-                    f"Мы активируем премиум вручную.\n\n"
-                    f"Ошибка: {error_details}"
-                )
-                await update.message.reply_text(error_msg, parse_mode="Markdown")
+            # Формируем сообщение об ошибке без Markdown, чтобы избежать ошибок парсинга
+            error_msg = (
+                f"❌ Произошла ошибка при активации премиума.\n\n"
+                f"Не волнуйтесь! Ваши деньги в безопасности.\n\n"
+                f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
+                f"• Ваш user_id: {user_id if 'user_id' in locals() else 'неизвестен'}\n"
+                f"• Payload: {payment.invoice_payload if 'payment' in locals() else 'неизвестен'}\n\n"
+                f"Мы активируем премиум вручную."
+            )
+            try:
+                await update.message.reply_text(error_msg)
+            except Exception as send_error:
+                logging.error(f"❌ Не удалось отправить сообщение об ошибке пользователю: {send_error}")
         
         application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
         application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))

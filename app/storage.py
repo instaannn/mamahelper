@@ -1019,7 +1019,6 @@ async def complete_payment(
             
             # Если не нашли pending, проверяем, может быть платеж уже обработан
             if not row:
-                import logging
                 logging.warning(f"⚠️ Платеж с payload '{invoice_payload}' не найден со статусом 'pending'")
                 
                 # Проверяем, может быть платеж уже был обработан
