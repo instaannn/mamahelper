@@ -837,7 +837,11 @@ async def get_bot_statistics() -> dict:
     # Используем retry логику для подключения к БД и выполнения всех запросов
     for attempt in range(MAX_RETRIES):
         try:
-            async with _db_connect_with_retry() as db:
+            async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT) as db:
+                # Настройки оптимизации SQLite
+                await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("PRAGMA synchronous=NORMAL")
+                await db.execute("PRAGMA busy_timeout=30000")
                 db.row_factory = aiosqlite.Row
                 
                 try:
@@ -953,7 +957,6 @@ async def get_bot_statistics() -> dict:
                     break
                     
                 except Exception as e:
-                    import logging
                     logging.error(f"Error in get_bot_statistics (attempt {attempt + 1}): {e}", exc_info=True)
                     # Если это не последняя попытка, продолжаем
                     if attempt < MAX_RETRIES - 1:
