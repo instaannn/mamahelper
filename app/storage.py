@@ -251,6 +251,16 @@ async def init_db() -> None:
             logging.warning(f"Migration error (may be expected): {e}")
             pass
         
+        # Таблица для отслеживания пользователей бота
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_users (
+                user_id INTEGER NOT NULL PRIMARY KEY,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                total_interactions INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        
         # Таблица премиум-подписок пользователей
         await db.execute("""
             CREATE TABLE IF NOT EXISTS user_premium (
@@ -261,6 +271,30 @@ async def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (user_id)
             )
+        """)
+        
+        # Таблица платежей для отслеживания транзакций
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                invoice_payload TEXT NOT NULL,
+                provider_payment_charge_id TEXT,
+                amount INTEGER NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'RUB',
+                subscription_type TEXT,
+                subscription_days INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES user_premium(user_id)
+            )
+        """)
+        
+        # Создаем индекс для быстрого поиска по user_id и статусу
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_payments_user_status 
+            ON payments(user_id, status)
         """)
         
         # Таблица записей дневника приема лекарств
@@ -293,6 +327,24 @@ async def init_db() -> None:
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_dose_events_user_created 
             ON dose_events(user_id, created_at)
+        """)
+        
+        # Таблица для отслеживания отправленных уведомлений о истечении премиума
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS premium_expiry_notifications (
+                notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                premium_until TEXT NOT NULL,
+                notification_sent_at TEXT NOT NULL,
+                days_until_expiry INTEGER NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES user_premium(user_id)
+            )
+        """)
+        
+        # Создаем индекс для быстрого поиска по user_id и premium_until
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_premium_notifications_user_until 
+            ON premium_expiry_notifications(user_id, premium_until)
         """)
         
         await db.commit()
@@ -528,4 +580,394 @@ async def set_user_premium(user_id: int, is_premium: bool, premium_until: Option
                     now.isoformat(),
                 ))
         
+        await db.commit()
+
+# ---------- Отслеживание пользователей ----------
+async def track_user_interaction(user_id: int) -> None:
+    """
+    Отследить взаимодействие пользователя с ботом.
+    Вызывается при каждом взаимодействии (команда, сообщение и т.д.)
+    """
+    now = datetime.now(timezone.utc)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Проверяем, есть ли уже запись
+        async with db.execute(
+            "SELECT user_id FROM bot_users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            existing = await cursor.fetchone()
+            
+            if existing:
+                # Обновляем последнее взаимодействие
+                await db.execute("""
+                    UPDATE bot_users
+                    SET last_seen_at = ?,
+                        total_interactions = total_interactions + 1
+                    WHERE user_id = ?
+                """, (now.isoformat(), user_id))
+            else:
+                # Создаем новую запись
+                await db.execute("""
+                    INSERT INTO bot_users
+                    (user_id, first_seen_at, last_seen_at, total_interactions)
+                    VALUES (?, ?, ?, 1)
+                """, (user_id, now.isoformat(), now.isoformat()))
+        
+        await db.commit()
+
+# ---------- Статистика ----------
+async def get_bot_statistics() -> dict:
+    """
+    Получить статистику бота.
+    
+    Returns:
+        Словарь со статистикой:
+        - total_users: всего уникальных пользователей
+        - active_users_30d: активных пользователей за последние 30 дней
+        - active_users_7d: активных пользователей за последние 7 дней
+        - premium_active: активных премиум подписок
+        - premium_total: всего когда-либо оформленных премиум подписок
+        - payments_completed: успешных платежей
+        - payments_pending: ожидающих платежей
+        - revenue_total: общая выручка (в копейках)
+        - subscriptions_1month: подписок на 1 месяц
+        - subscriptions_3months: подписок на 3 месяца
+    """
+    now = datetime.now(timezone.utc)
+    thirty_days_ago = now - timedelta(days=30)
+    seven_days_ago = now - timedelta(days=7)
+    
+    stats = {}
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Всего уникальных пользователей
+        async with db.execute("SELECT COUNT(DISTINCT user_id) as count FROM bot_users") as cursor:
+            row = await cursor.fetchone()
+            stats["total_users"] = row[0] if row else 0
+        
+        # Активные пользователи за 30 дней
+        async with db.execute("""
+            SELECT COUNT(DISTINCT user_id) as count 
+            FROM bot_users 
+            WHERE last_seen_at >= ?
+        """, (thirty_days_ago.isoformat(),)) as cursor:
+            row = await cursor.fetchone()
+            stats["active_users_30d"] = row[0] if row else 0
+        
+        # Активные пользователи за 7 дней
+        async with db.execute("""
+            SELECT COUNT(DISTINCT user_id) as count 
+            FROM bot_users 
+            WHERE last_seen_at >= ?
+        """, (seven_days_ago.isoformat(),)) as cursor:
+            row = await cursor.fetchone()
+            stats["active_users_7d"] = row[0] if row else 0
+        
+        # Активные премиум подписки
+        async with db.execute("""
+            SELECT COUNT(*) as count 
+            FROM user_premium 
+            WHERE is_premium = 1 
+                AND (premium_until IS NULL OR premium_until > ?)
+        """, (now.isoformat(),)) as cursor:
+            row = await cursor.fetchone()
+            stats["premium_active"] = row[0] if row else 0
+        
+        # Всего когда-либо было премиум подписок
+        async with db.execute("SELECT COUNT(*) as count FROM user_premium WHERE is_premium = 1 OR premium_until IS NOT NULL") as cursor:
+            row = await cursor.fetchone()
+            stats["premium_total"] = row[0] if row else 0
+        
+        # Успешные платежи
+        async with db.execute("""
+            SELECT COUNT(*) as count, SUM(amount) as total
+            FROM payments 
+            WHERE status = 'completed'
+        """) as cursor:
+            row = await cursor.fetchone()
+            stats["payments_completed"] = row[0] if row and row[0] else 0
+            stats["revenue_total"] = row[1] if row and row[1] else 0
+        
+        # Ожидающие платежи
+        async with db.execute("""
+            SELECT COUNT(*) as count 
+            FROM payments 
+            WHERE status = 'pending'
+        """) as cursor:
+            row = await cursor.fetchone()
+            stats["payments_pending"] = row[0] if row else 0
+        
+        # Подписки на 1 месяц
+        async with db.execute("""
+            SELECT COUNT(*) as count 
+            FROM payments 
+            WHERE status = 'completed' AND subscription_type = '1month'
+        """) as cursor:
+            row = await cursor.fetchone()
+            stats["subscriptions_1month"] = row[0] if row else 0
+        
+        # Подписки на 3 месяца
+        async with db.execute("""
+            SELECT COUNT(*) as count 
+            FROM payments 
+            WHERE status = 'completed' AND subscription_type = '3months'
+        """) as cursor:
+            row = await cursor.fetchone()
+            stats["subscriptions_3months"] = row[0] if row else 0
+    
+    return stats
+
+# ---------- Платежи ----------
+async def save_payment(
+    user_id: int,
+    invoice_payload: str,
+    amount: int,
+    currency: str,
+    subscription_type: str,
+    subscription_days: int
+) -> None:
+    """
+    Сохранить информацию о платеже в БД.
+    Вызывается при создании инвойса (счета на оплату).
+    
+    Args:
+        user_id: ID пользователя
+        invoice_payload: Уникальный идентификатор платежа (payload из инвойса)
+        amount: Сумма платежа в копейках
+        currency: Валюта (например, "RUB")
+        subscription_type: Тип подписки (например, "1month", "3months")
+        subscription_days: Количество дней подписки (30 или 90)
+    """
+    now = datetime.now(timezone.utc)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO payments
+            (user_id, invoice_payload, amount, currency, subscription_type, subscription_days, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+        """, (
+            user_id,
+            invoice_payload,
+            amount,
+            currency,
+            subscription_type,
+            subscription_days,
+            now.isoformat()
+        ))
+        await db.commit()
+
+async def complete_payment(
+    invoice_payload: str,
+    provider_payment_charge_id: str
+) -> Optional[dict]:
+    """
+    Отметить платеж как выполненный и активировать премиум-подписку.
+    Вызывается после успешной оплаты.
+    
+    Args:
+        invoice_payload: Уникальный идентификатор платежа (payload из инвойса)
+        provider_payment_charge_id: ID платежа от провайдера
+    
+    Returns:
+        Словарь с информацией о платеже и подписке, или None если платеж не найден
+    """
+    now = datetime.now(timezone.utc)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        # Находим платеж по payload
+        async with db.execute("""
+            SELECT user_id, subscription_days, status
+            FROM payments
+            WHERE invoice_payload = ? AND status = 'pending'
+        """, (invoice_payload,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            
+            user_id = row["user_id"]
+            subscription_days = row["subscription_days"]
+            
+            # Обновляем статус платежа
+            await db.execute("""
+                UPDATE payments
+                SET status = 'completed',
+                    provider_payment_charge_id = ?,
+                    completed_at = ?
+                WHERE invoice_payload = ?
+            """, (provider_payment_charge_id, now.isoformat(), invoice_payload))
+            
+            # Активируем премиум-подписку
+            # Получаем текущую дату окончания премиума (если есть)
+            async with db.execute("""
+                SELECT premium_until FROM user_premium WHERE user_id = ?
+            """, (user_id,)) as cursor2:
+                existing_row = await cursor2.fetchone()
+                if existing_row and existing_row["premium_until"]:
+                    # Если подписка уже есть, продлеваем её
+                    current_until = datetime.fromisoformat(existing_row["premium_until"])
+                    if current_until > now:
+                        # Подписка еще активна - продлеваем от текущей даты окончания
+                        new_until = current_until + timedelta(days=subscription_days)
+                    else:
+                        # Подписка истекла - начинаем с сегодня
+                        new_until = now + timedelta(days=subscription_days)
+                else:
+                    # Нет активной подписки - начинаем с сегодня
+                    new_until = now + timedelta(days=subscription_days)
+            
+            # Устанавливаем премиум-статус
+            await set_user_premium(user_id, True, new_until)
+            
+            await db.commit()
+            
+            return {
+                "user_id": user_id,
+                "subscription_days": subscription_days,
+                "premium_until": new_until
+            }
+
+# ---------- Уведомления о истечении премиума ----------
+async def get_users_with_expiring_premium(min_days: int = 3, max_days: int = 5) -> List[tuple]:
+    """
+    Получить список пользователей, у которых премиум истекает через min_days-max_days дней.
+    
+    Args:
+        min_days: Минимальное количество дней до истечения (по умолчанию 3)
+        max_days: Максимальное количество дней до истечения (по умолчанию 5)
+    
+    Returns:
+        Список кортежей (user_id, premium_until, days_until_expiry)
+    """
+    now = datetime.now(timezone.utc)
+    min_date = now + timedelta(days=min_days)
+    max_date = now + timedelta(days=max_days)
+    
+    users = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT user_id, premium_until
+            FROM user_premium
+            WHERE is_premium = 1
+                AND premium_until IS NOT NULL
+                AND premium_until >= ?
+                AND premium_until <= ?
+        """, (min_date.isoformat(), max_date.isoformat())) as cursor:
+            async for row in cursor:
+                premium_until = datetime.fromisoformat(row["premium_until"])
+                days_until = (premium_until - now).days
+                users.append((row["user_id"], row["premium_until"], days_until))
+    
+    return users
+
+async def get_users_with_expired_premium() -> List[tuple]:
+    """
+    Получить список пользователей, у которых премиум истек сегодня (в течение последних 24 часов).
+    
+    Returns:
+        Список кортежей (user_id, premium_until)
+    """
+    now = datetime.now(timezone.utc)
+    # Ищем пользователей, у которых премиум истек в течение последних 24 часов
+    # но статус еще не обновлен (is_premium = 1)
+    yesterday = now - timedelta(days=1)
+    
+    users = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT user_id, premium_until
+            FROM user_premium
+            WHERE is_premium = 1
+                AND premium_until IS NOT NULL
+                AND premium_until >= ?
+                AND premium_until <= ?
+        """, (yesterday.isoformat(), now.isoformat())) as cursor:
+            async for row in cursor:
+                premium_until = datetime.fromisoformat(row["premium_until"])
+                # Проверяем, что премиум действительно истек
+                if premium_until <= now:
+                    users.append((row["user_id"], row["premium_until"]))
+    
+    return users
+
+async def disable_expired_premium_subscriptions() -> int:
+    """
+    Автоматически отключить все истекшие премиум подписки.
+    
+    Returns:
+        Количество отключенных подписок
+    """
+    now = datetime.now(timezone.utc)
+    disabled_count = 0
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Находим все истекшие подписки
+        async with db.execute("""
+            SELECT user_id, premium_until
+            FROM user_premium
+            WHERE is_premium = 1
+                AND premium_until IS NOT NULL
+                AND premium_until <= ?
+        """, (now.isoformat(),)) as cursor:
+            expired_subscriptions = await cursor.fetchall()
+            
+            # Отключаем каждую истекшую подписку
+            for row in expired_subscriptions:
+                user_id = row[0]
+                await db.execute("""
+                    UPDATE user_premium
+                    SET is_premium = 0,
+                        updated_at = ?
+                    WHERE user_id = ?
+                """, (now.isoformat(), user_id))
+                disabled_count += 1
+        
+        await db.commit()
+    
+    if disabled_count > 0:
+        logging.info(f"✅ Автоматически отключено {disabled_count} истекших премиум подписок")
+    
+    return disabled_count
+
+async def has_notification_been_sent(user_id: int, premium_until: str) -> bool:
+    """
+    Проверить, было ли уже отправлено уведомление для данного пользователя и даты окончания премиума.
+    
+    Args:
+        user_id: ID пользователя
+        premium_until: Дата окончания премиума (ISO формат)
+    
+    Returns:
+        True если уведомление уже было отправлено, False иначе
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT COUNT(*) as count
+            FROM premium_expiry_notifications
+            WHERE user_id = ? AND premium_until = ?
+        """, (user_id, premium_until)) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0] and row[0] > 0)
+
+async def mark_notification_sent(user_id: int, premium_until: str, days_until_expiry: int) -> None:
+    """
+    Отметить, что уведомление было отправлено пользователю.
+    
+    Args:
+        user_id: ID пользователя
+        premium_until: Дата окончания премиума (ISO формат)
+        days_until_expiry: Количество дней до истечения
+    """
+    now = datetime.now(timezone.utc)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO premium_expiry_notifications
+            (user_id, premium_until, notification_sent_at, days_until_expiry)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, premium_until, now.isoformat(), days_until_expiry))
         await db.commit()

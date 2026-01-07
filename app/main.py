@@ -6,10 +6,10 @@ import subprocess
 import time
 import asyncio
 from dotenv import load_dotenv
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram import Update, LabeledPrice
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters, PreCheckoutQueryHandler
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -17,7 +17,14 @@ from app.handlers.dose import build_calculate_conversation
 from app.handlers.feedback import build_feedback_conversation
 from app.handlers.redflags import build_redflags_handlers
 from app.handlers.profile import build_profile_handlers
-from app.storage import init_db, get_child_profile, set_user_premium, is_user_premium
+from app.storage import (
+    init_db, get_child_profile, set_user_premium, is_user_premium,
+    get_users_with_expiring_premium, get_users_with_expired_premium,
+    has_notification_been_sent, mark_notification_sent,
+    save_payment, complete_payment,
+    track_user_interaction, get_bot_statistics,
+    disable_expired_premium_subscriptions
+)
 from app.utils import is_premium_user
 
 # Загружаем переменные окружения из .env файла
@@ -39,6 +46,20 @@ if not API_TOKEN:
         "Получите токен от @BotFather в Telegram."
     )
 
+# Токен провайдера платежей (опционально, для Telegram Payments)
+PROVIDER_TOKEN = os.getenv('PROVIDER_TOKEN')
+
+# ID администратора бота (для доступа к статистике)
+ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
+if ADMIN_USER_ID:
+    try:
+        ADMIN_USER_ID = int(ADMIN_USER_ID)
+    except ValueError:
+        ADMIN_USER_ID = None
+        logging.warning("⚠️ ADMIN_USER_ID должен быть числом")
+else:
+    ADMIN_USER_ID = None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start с новым приветственным сценарием."""
     if not update.message:
@@ -47,6 +68,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"Received /start command from user {update.effective_user.id}")
     try:
+        # Отслеживаем взаимодействие пользователя
+        await track_user_interaction(update.effective_user.id)
+        
         user = update.effective_user
         # Используем имя профиля (first_name), если нет - username, если нет - "друг"
         user_name = user.first_name or user.username or "друг"
@@ -683,24 +707,84 @@ async def handle_dose_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(diary_text, parse_mode="Markdown", reply_markup=diary_keyboard)
 
 async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок покупки премиум (пока заглушки)."""
+    """Обработчик кнопок покупки премиум - отправка инвойсов."""
     query = update.callback_query
     await query.answer()  # Убираем "часики" у кнопки
     
+    if not PROVIDER_TOKEN:
+        await query.message.reply_text(
+            "❌ Платежная система не настроена.\n\n"
+            "Обратитесь к администратору бота."
+        )
+        return
+    
+    user_id = query.from_user.id
+    
     if query.data == "premium_buy_1month":
-        await query.message.reply_text(
-            "🌟 Покупка премиум-подписки на 1 месяц (99₽)\n\n"
-            "💳 Система оплаты находится в разработке.\n\n"
-            "Скоро вы сможете оформить подписку прямо здесь! "
-            "А пока все основные функции бота остаются бесплатными 💚"
-        )
+        # Премиум на 1 месяц - 99₽
+        payload = f"premium_1month_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
+        prices = [LabeledPrice("Премиум-подписка на 1 месяц", 99 * 100)]  # 99₽ в копейках
+        
+        try:
+            await query.message.reply_invoice(
+                title="🌟 Премиум-подписка на 1 месяц",
+                description="Получите доступ ко всем премиум-функциям бота на 1 месяц:\n\n"
+                            "• 👶 Профиль ребенка\n"
+                            "• 📊 Дневник лекарств\n"
+                            "• 🚩 Красные флаги",
+                payload=payload,
+                provider_token=PROVIDER_TOKEN,
+                currency="RUB",
+                prices=prices,
+                need_name=False,
+                need_phone_number=False,
+                need_email=False,
+                need_shipping_address=False,
+                send_phone_number_to_provider=False,
+                send_email_to_provider=False,
+                is_flexible=False,
+            )
+            # Сохраняем информацию о платеже в БД
+            await save_payment(user_id, payload, 99, "RUB", "1month", 30)
+        except Exception as e:
+            logging.error(f"Error sending invoice for 1 month: {e}", exc_info=True)
+            await query.message.reply_text(
+                "❌ Ошибка при создании счета. Пожалуйста, попробуйте позже."
+            )
+    
     elif query.data == "premium_buy_3months":
-        await query.message.reply_text(
-            "🌟 Покупка премиум-подписки на 3 месяца (270₽)\n\n"
-            "💳 Система оплаты находится в разработке.\n\n"
-            "Скоро вы сможете оформить подписку прямо здесь! "
-            "А пока все основные функции бота остаются бесплатными 💚"
-        )
+        # Премиум на 3 месяца - 270₽
+        payload = f"premium_3months_{user_id}_{int(datetime.now(timezone.utc).timestamp())}"
+        prices = [LabeledPrice("Премиум-подписка на 3 месяца", 270 * 100)]  # 270₽ в копейках
+        
+        try:
+            await query.message.reply_invoice(
+                title="🌟 Премиум-подписка на 3 месяца",
+                description="Получите доступ ко всем премиум-функциям бота на 3 месяца:\n\n"
+                            "• 👶 Профиль ребенка\n"
+                            "• 📊 Дневник лекарств\n"
+                            "• 🚩 Красные флаги\n\n"
+                            "💰 Выгоднее на 9%!",
+                payload=payload,
+                provider_token=PROVIDER_TOKEN,
+                currency="RUB",
+                prices=prices,
+                need_name=False,
+                need_phone_number=False,
+                need_email=False,
+                need_shipping_address=False,
+                send_phone_number_to_provider=False,
+                send_email_to_provider=False,
+                is_flexible=False,
+            )
+            # Сохраняем информацию о платеже в БД
+            await save_payment(user_id, payload, 270, "RUB", "3months", 90)
+        except Exception as e:
+            logging.error(f"Error sending invoice for 3 months: {e}", exc_info=True)
+            await query.message.reply_text(
+                "❌ Ошибка при создании счета. Пожалуйста, попробуйте позже."
+            )
+    
     elif query.data == "premium_support":
         await query.message.reply_text(
             "❤️ Спасибо за желание поддержать проект!\n\n"
@@ -785,6 +869,57 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     premium_markup = InlineKeyboardMarkup(premium_keyboard)
     
     await update.message.reply_text(premium_text, reply_markup=premium_markup)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать статистику бота (только для администратора)."""
+    if not update.message:
+        return
+    
+    user_id = update.effective_user.id
+    
+    # Проверяем, является ли пользователь администратором
+    if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+        await update.message.reply_text(
+            "❌ У вас нет доступа к этой команде.\n\n"
+            "Эта команда доступна только администратору бота."
+        )
+        logging.warning(f"User {user_id} attempted to access /stats command")
+        return
+    
+    try:
+        # Получаем статистику
+        stats = await get_bot_statistics()
+        
+        # Форматируем выручку (из копеек в рубли)
+        revenue_rub = stats["revenue_total"] / 100 if stats["revenue_total"] else 0
+        
+        # Формируем сообщение со статистикой
+        stats_text = (
+            f"📊 **Статистика бота**\n\n"
+            f"👥 **Пользователи:**\n"
+            f"• Всего пользователей: {stats['total_users']}\n"
+            f"• Активных за 30 дней: {stats['active_users_30d']}\n"
+            f"• Активных за 7 дней: {stats['active_users_7d']}\n\n"
+            f"⭐ **Премиум подписки:**\n"
+            f"• Активных подписок: {stats['premium_active']}\n"
+            f"• Всего оформлено: {stats['premium_total']}\n\n"
+            f"💳 **Платежи:**\n"
+            f"• Успешных платежей: {stats['payments_completed']}\n"
+            f"• Ожидающих платежей: {stats['payments_pending']}\n"
+            f"• Общая выручка: {revenue_rub:.2f} ₽\n\n"
+            f"📦 **Подписки по типам:**\n"
+            f"• На 1 месяц: {stats['subscriptions_1month']}\n"
+            f"• На 3 месяца: {stats['subscriptions_3months']}\n"
+        )
+        
+        await update.message.reply_text(stats_text, parse_mode="Markdown")
+        logging.info(f"Admin {user_id} requested statistics")
+        
+    except Exception as e:
+        logging.error(f"Error in stats_command: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Произошла ошибка при получении статистики. Пожалуйста, попробуйте позже."
+        )
 
 async def test_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для тестирования премиум-статуса (переключает статус)."""
@@ -876,10 +1011,201 @@ def check_running_bot_processes():
         logging.debug(f"Не удалось проверить процессы (это нормально): {e}")
         return []
 
+async def send_premium_expiry_notification(context: ContextTypes.DEFAULT_TYPE, user_id: int, days_until: int) -> None:
+    """
+    Отправить уведомление пользователю о скором истечении премиума.
+    
+    Args:
+        context: Контекст приложения
+        user_id: ID пользователя
+        days_until: Количество дней до истечения
+    """
+    try:
+        # Формируем сообщение
+        if days_until == 3:
+            days_text = "3 дня"
+        elif days_until == 4:
+            days_text = "4 дня"
+        elif days_until == 5:
+            days_text = "5 дней"
+        else:
+            days_text = f"{days_until} дней"
+        
+        notification_text = (
+            f"⏰ **Напоминание о премиум-подписке**\n\n"
+            f"Ваша премиум-подписка истекает через {days_text}.\n\n"
+            f"Чтобы продолжить пользоваться всеми удобными функциями:\n"
+            f"• 👶 Профиль ребенка\n"
+            f"• 📊 Дневник лекарств\n"
+            f"• 🚩 Красные флаги\n\n"
+            f"Продлите подписку прямо сейчас! ✨"
+        )
+        
+        # Создаем кнопки для продления
+        premium_keyboard = [
+            [InlineKeyboardButton("🌟 1 месяц - 99₽", callback_data="premium_buy_1month")],
+            [InlineKeyboardButton("🌟 3 месяца - 270₽", callback_data="premium_buy_3months")],
+            [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
+        ]
+        premium_markup = InlineKeyboardMarkup(premium_keyboard)
+        
+        # Отправляем сообщение
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=notification_text,
+            reply_markup=premium_markup,
+            parse_mode="Markdown"
+        )
+        
+        logging.info(f"✅ Отправлено уведомление о истечении премиума пользователю {user_id} (осталось {days_until} дней)")
+    except Exception as e:
+        logging.error(f"❌ Ошибка при отправке уведомления пользователю {user_id}: {e}", exc_info=True)
+
+async def send_premium_expired_notification(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """
+    Отправить уведомление пользователю об истечении премиума.
+    
+    Args:
+        context: Контекст приложения
+        user_id: ID пользователя
+    """
+    try:
+        notification_text = (
+            f"⏰ **Ваша премиум-подписка истекла**\n\n"
+            f"К сожалению, срок действия вашей премиум-подписки закончился.\n\n"
+            f"Чтобы снова получить доступ ко всем удобным функциям:\n"
+            f"• 👶 Профиль ребенка\n"
+            f"• 📊 Дневник лекарств\n"
+            f"• 🚩 Красные флаги\n\n"
+            f"Продлите подписку прямо сейчас! ✨"
+        )
+        
+        # Создаем кнопки для продления
+        premium_keyboard = [
+            [InlineKeyboardButton("🌟 1 месяц - 99₽", callback_data="premium_buy_1month")],
+            [InlineKeyboardButton("🌟 3 месяца - 270₽", callback_data="premium_buy_3months")],
+            [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
+        ]
+        premium_markup = InlineKeyboardMarkup(premium_keyboard)
+        
+        # Отправляем сообщение
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=notification_text,
+            reply_markup=premium_markup,
+            parse_mode="Markdown"
+        )
+        
+        logging.info(f"✅ Отправлено уведомление об истечении премиума пользователю {user_id}")
+    except Exception as e:
+        logging.error(f"❌ Ошибка при отправке уведомления об истечении пользователю {user_id}: {e}", exc_info=True)
+
+async def check_and_send_premium_expiry_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Периодическая задача для проверки и отправки уведомлений о истечении премиума.
+    """
+    try:
+        # 1. Получаем пользователей с истекающим премиумом (3-5 дней)
+        users_expiring = await get_users_with_expiring_premium(min_days=3, max_days=5)
+        
+        if users_expiring:
+            logging.info(f"Найдено {len(users_expiring)} пользователей с истекающим премиумом (3-5 дней)")
+            
+            for user_id, premium_until, days_until in users_expiring:
+                # Проверяем, не было ли уже отправлено уведомление
+                if await has_notification_been_sent(user_id, premium_until):
+                    logging.debug(f"Уведомление уже отправлено пользователю {user_id} для даты {premium_until}")
+                    continue
+                
+                # Отправляем уведомление
+                await send_premium_expiry_notification(context, user_id, days_until)
+                
+                # Отмечаем, что уведомление отправлено
+                await mark_notification_sent(user_id, premium_until, days_until)
+                
+                # Небольшая задержка между отправками, чтобы не перегружать API
+                await asyncio.sleep(0.5)
+            
+            logging.info(f"✅ Обработано {len(users_expiring)} уведомлений о скором истечении премиума")
+        
+        # 2. Получаем пользователей с истекшим премиумом (сегодня)
+        users_expired = await get_users_with_expired_premium()
+        
+        if users_expired:
+            logging.info(f"Найдено {len(users_expired)} пользователей с истекшим премиумом")
+            
+            for user_id, premium_until in users_expired:
+                # Проверяем, не было ли уже отправлено уведомление об истечении
+                if await has_notification_been_sent(user_id, premium_until):
+                    logging.debug(f"Уведомление об истечении уже отправлено пользователю {user_id} для даты {premium_until}")
+                    continue
+                
+                # Отправляем уведомление об истечении
+                await send_premium_expired_notification(context, user_id)
+                
+                # Отмечаем, что уведомление отправлено (используем days_until_expiry = 0 для истекших)
+                await mark_notification_sent(user_id, premium_until, 0)
+                
+                # Обновляем статус премиума в БД (на случай если он еще не обновлен)
+                from app.storage import set_user_premium
+                await set_user_premium(user_id, False, None)
+                
+                # Небольшая задержка между отправками
+                await asyncio.sleep(0.5)
+            
+            logging.info(f"✅ Обработано {len(users_expired)} уведомлений об истечении премиума")
+        
+        if not users_expiring and not users_expired:
+            logging.debug("Нет пользователей с истекающим или истекшим премиумом")
+            
+    except Exception as e:
+        logging.error(f"❌ Ошибка при проверке уведомлений о истечении премиума: {e}", exc_info=True)
+
+async def disable_expired_subscriptions_task(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Периодическая задача для автоматического отключения всех истекших премиум подписок.
+    """
+    try:
+        disabled_count = await disable_expired_premium_subscriptions()
+        if disabled_count > 0:
+            logging.info(f"✅ Автоматически отключено {disabled_count} истекших премиум подписок")
+    except Exception as e:
+        logging.error(f"❌ Ошибка при отключении истекших подписок: {e}", exc_info=True)
+
 async def post_init(application: Application) -> None:
     """Инициализация БД при старте приложения."""
     await init_db()
     logging.info("База данных инициализирована")
+    
+    # Запускаем периодическую задачу для проверки уведомлений о истечении премиума
+    # Проверяем каждый день в 10:00 по UTC (13:00 по Москве)
+    job_queue = application.job_queue
+    if job_queue:
+        # Запускаем проверку сразу при старте (через 10 секунд, для тестирования)
+        job_queue.run_once(check_and_send_premium_expiry_notifications, when=10)
+        
+        # Затем запускаем ежедневную проверку в 10:00 UTC
+        # Используем time.time() для создания объекта time
+        check_time = dt_time(hour=10, minute=0, second=0)
+        job_queue.run_daily(
+            check_and_send_premium_expiry_notifications,
+            time=check_time,
+            name="premium_expiry_check"
+        )
+        logging.info("✅ Периодическая задача для проверки уведомлений о истечении премиума настроена (ежедневно в 10:00 UTC)")
+        
+        # Запускаем задачу для автоматического отключения истекших подписок
+        # Запускаем сразу при старте (через 30 секунд)
+        job_queue.run_once(disable_expired_subscriptions_task, when=30)
+        
+        # Затем запускаем ежедневно в 00:00 UTC (03:00 по Москве) для отключения истекших подписок
+        disable_time = dt_time(hour=0, minute=0, second=0)
+        job_queue.run_daily(
+            disable_expired_subscriptions_task,
+            time=disable_time,
+            name="disable_expired_premium"
+        )
+        logging.info("✅ Периодическая задача для отключения истекших премиум подписок настроена (ежедневно в 00:00 UTC)")
     
     # Явно очищаем webhook перед запуском polling с несколькими попытками
     max_attempts = 3
@@ -948,6 +1274,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("premium", premium_command))
+    application.add_handler(CommandHandler("stats", stats_command))
     # application.add_handler(CommandHandler("test_premium", test_premium_command))  # Команда для тестирования премиума (закомментирована)
     
     # Диалоги/обработчики (должны быть ПЕРЕД общими обработчиками кнопок)
@@ -971,8 +1298,69 @@ def main():
     # Обработчик просмотра дневника
     application.add_handler(CallbackQueryHandler(handle_dose_diary, pattern="^dose_diary$"))
     
-    # Обработчики кнопок покупки премиум (пока заглушки)
+    # Обработчики кнопок покупки премиум
     application.add_handler(CallbackQueryHandler(handle_premium_buttons, pattern="^premium_"))
+    
+    # Обработчики платежей
+    async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработчик запроса на проверку платежа перед оплатой."""
+        query = update.pre_checkout_query
+        if query:
+            # Всегда подтверждаем платеж (в реальном приложении здесь можно добавить дополнительную проверку)
+            await query.answer(ok=True)
+            logging.info(f"✅ Pre-checkout query approved for user {query.from_user.id}, payload: {query.invoice_payload}")
+    
+    async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработчик успешного платежа."""
+        if not update.message or not update.message.successful_payment:
+            return
+        
+        payment = update.message.successful_payment
+        user_id = update.message.from_user.id
+        
+        try:
+            # Завершаем платеж и активируем премиум
+            result = await complete_payment(
+                invoice_payload=payment.invoice_payload,
+                provider_payment_charge_id=payment.provider_payment_charge_id
+            )
+            
+            if result:
+                premium_until = result["premium_until"]
+                subscription_days = result["subscription_days"]
+                
+                # Форматируем дату окончания для отображения
+                moscow_tz = timezone(timedelta(hours=3))
+                until_local = premium_until.astimezone(moscow_tz)
+                until_str = until_local.strftime("%d.%m.%Y")
+                
+                success_text = (
+                    f"✅ **Платеж успешно обработан!**\n\n"
+                    f"✨ Ваша премиум-подписка активирована на {subscription_days} дней!\n\n"
+                    f"📅 Подписка действует до: {until_str}\n\n"
+                    f"Теперь вам доступны все премиум-функции:\n"
+                    f"• 👶 Профиль ребенка\n"
+                    f"• 📊 Дневник лекарств\n"
+                    f"• 🚩 Красные флаги\n\n"
+                    f"Спасибо за поддержку! 💚"
+                )
+                
+                await update.message.reply_text(success_text, parse_mode="Markdown")
+                logging.info(f"✅ Премиум активирован для пользователя {user_id} до {until_str}")
+            else:
+                await update.message.reply_text(
+                    "❌ Ошибка при обработке платежа. Пожалуйста, свяжитесь с поддержкой."
+                )
+                logging.error(f"❌ Не удалось найти платеж с payload: {payment.invoice_payload}")
+        except Exception as e:
+            logging.error(f"❌ Ошибка при обработке успешного платежа: {e}", exc_info=True)
+            await update.message.reply_text(
+                "❌ Произошла ошибка при активации премиума. Пожалуйста, свяжитесь с поддержкой."
+            )
+    
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    
     application.add_handler(build_feedback_conversation())
 
     # Красные флаги (ОРВИ + ЖКТ)
