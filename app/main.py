@@ -1440,383 +1440,409 @@ async def post_init(application: Application) -> None:
     logging.info("✅ Готово к запуску polling")
 
 def main():
-    # Проверка токена уже выполнена при загрузке модуля
-    if not API_TOKEN:
-        raise SystemExit("Токен не установлен. Проверьте переменную окружения TELEGRAM_BOT_TOKEN.")
+    """Главная функция запуска бота."""
+    try:
+        logging.info("=" * 60)
+        logging.info("🚀 Запуск бота...")
+        logging.info("=" * 60)
+        
+        # Проверка токена уже выполнена при загрузке модуля
+        if not API_TOKEN:
+            raise SystemExit("Токен не установлен. Проверьте переменную окружения TELEGRAM_BOT_TOKEN.")
+        
+        logging.info("✅ Токен проверен")
 
-    # Проверяем, не запущен ли уже другой экземпляр бота
-    running_processes = check_running_bot_processes()
-    if running_processes:
-        logging.warning("=" * 60)
-        logging.warning("⚠️  ВНИМАНИЕ: Обнаружены запущенные процессы бота!")
-        logging.warning(f"⚠️  PID процессов: {running_processes}")
-        logging.warning("⚠️  Это может вызывать ошибки 409 Conflict.")
-        logging.warning("⚠️  Рекомендуется завершить старые процессы:")
-        for pid in running_processes:
-            logging.warning(f"⚠️    kill {pid}")
-        logging.warning("=" * 60)
-        logging.warning("Продолжаем запуск через 3 секунды...")
-        time.sleep(3)
+        # Проверяем, не запущен ли уже другой экземпляр бота
+        running_processes = check_running_bot_processes()
+        if running_processes:
+            logging.warning("=" * 60)
+            logging.warning("⚠️  ВНИМАНИЕ: Обнаружены запущенные процессы бота!")
+            logging.warning(f"⚠️  PID процессов: {running_processes}")
+            logging.warning("⚠️  Это может вызывать ошибки 409 Conflict.")
+            logging.warning("⚠️  Рекомендуется завершить старые процессы:")
+            for pid in running_processes:
+                logging.warning(f"⚠️    kill {pid}")
+            logging.warning("=" * 60)
+            logging.warning("Продолжаем запуск через 3 секунды...")
+            time.sleep(3)
 
-    # Оптимизированные таймауты для HTTP запросов к Telegram API
-    from telegram.request import HTTPXRequest
-    request = HTTPXRequest(
-        connection_pool_size=8,
-        read_timeout=20.0,  # Увеличиваем для стабильности при медленном интернете
-        write_timeout=20.0,  # Увеличиваем для стабильности
-        connect_timeout=10.0,  # Увеличиваем таймаут подключения для сетевых проблем
-    )
-    
-    application = Application.builder().token(API_TOKEN).request(request).post_init(post_init).build()
-    
-    # Команды (должны быть ПЕРВЫМИ, чтобы не перехватывались другими обработчиками)
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("premium", premium_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    # application.add_handler(CommandHandler("test_premium", test_premium_command))  # Команда для тестирования премиума (закомментирована)
-    
-    # Диалоги/обработчики (должны быть ПЕРЕД общими обработчиками кнопок)
-    # ВАЖНО: Профиль регистрируем ПЕРЕД расчетом дозы, чтобы его ConversationHandler обрабатывал сообщения первым
-    for h in build_profile_handlers():
-        application.add_handler(h)
-    
-    # Расчет дозы (после профиля, чтобы не перехватывать сообщения)
-    application.add_handler(build_calculate_conversation())
-    
-    # Обработчики inline кнопок из /start (после ConversationHandler)
-    # Исключаем start_calculate и start_create_profile, так как они обрабатываются ConversationHandler
-    application.add_handler(CallbackQueryHandler(handle_start_button, pattern="^start_(?!calculate|create_profile)"))
-    
-    # Обработчики кнопок профиля (исключаем profile_edit_, так как он обрабатывается ConversationHandler)
-    application.add_handler(CallbackQueryHandler(handle_profile_buttons, pattern="^profile_(show|delete_)"))
-    
-    # Обработчик сохранения дозы в дневник
-    application.add_handler(CallbackQueryHandler(handle_dose_save, pattern="^dose_save$"))
-    
-    # Обработчик просмотра дневника
-    application.add_handler(CallbackQueryHandler(handle_dose_diary, pattern="^dose_diary$"))
-    
-    # Обработчики кнопок покупки премиум
-    application.add_handler(CallbackQueryHandler(handle_premium_buttons, pattern="^premium_"))
-    
-    # Обработчики платежей
-    async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик запроса на проверку платежа перед оплатой."""
-        query = update.pre_checkout_query
-        if query:
-            # Всегда подтверждаем платеж (в реальном приложении здесь можно добавить дополнительную проверку)
-            await query.answer(ok=True)
-            logging.info(f"✅ Pre-checkout query approved for user {query.from_user.id}, payload: {query.invoice_payload}")
-    
-    async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик успешного платежа."""
-        logging.info(f"💰 Получен успешный платеж от user {update.effective_user.id if update.effective_user else 'unknown'}")
+        # Оптимизированные таймауты для HTTP запросов к Telegram API
+        from telegram.request import HTTPXRequest
+        request = HTTPXRequest(
+            connection_pool_size=8,
+            read_timeout=20.0,  # Увеличиваем для стабильности при медленном интернете
+            write_timeout=20.0,  # Увеличиваем для стабильности
+            connect_timeout=10.0,  # Увеличиваем таймаут подключения для сетевых проблем
+        )
         
-        if not update.message or not update.message.successful_payment:
-            logging.warning("⚠️ successful_payment_callback вызван, но нет update.message или successful_payment")
-            return
+        application = Application.builder().token(API_TOKEN).request(request).post_init(post_init).build()
         
-        payment = update.message.successful_payment
-        user_id = update.message.from_user.id
+        # Команды (должны быть ПЕРВЫМИ, чтобы не перехватывались другими обработчиками)
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("premium", premium_command))
+        application.add_handler(CommandHandler("stats", stats_command))
+        # application.add_handler(CommandHandler("test_premium", test_premium_command))  # Команда для тестирования премиума (закомментирована)
         
-        logging.info(f"💰 Обработка платежа для user_id={user_id}, payload={payment.invoice_payload}, charge_id={payment.provider_payment_charge_id}")
+        # Диалоги/обработчики (должны быть ПЕРЕД общими обработчиками кнопок)
+        # ВАЖНО: Профиль регистрируем ПЕРЕД расчетом дозы, чтобы его ConversationHandler обрабатывал сообщения первым
+        for h in build_profile_handlers():
+            application.add_handler(h)
         
-        try:
-            # Завершаем платеж и активируем премиум
-            result = await complete_payment(
-                invoice_payload=payment.invoice_payload,
-                provider_payment_charge_id=payment.provider_payment_charge_id
-            )
+        # Расчет дозы (после профиля, чтобы не перехватывать сообщения)
+        application.add_handler(build_calculate_conversation())
+        
+        # Обработчики inline кнопок из /start (после ConversationHandler)
+        # Исключаем start_calculate и start_create_profile, так как они обрабатываются ConversationHandler
+        application.add_handler(CallbackQueryHandler(handle_start_button, pattern="^start_(?!calculate|create_profile)"))
+        
+        # Обработчики кнопок профиля (исключаем profile_edit_, так как он обрабатывается ConversationHandler)
+        application.add_handler(CallbackQueryHandler(handle_profile_buttons, pattern="^profile_(show|delete_)"))
+        
+        # Обработчик сохранения дозы в дневник
+        application.add_handler(CallbackQueryHandler(handle_dose_save, pattern="^dose_save$"))
+        
+        # Обработчик просмотра дневника
+        application.add_handler(CallbackQueryHandler(handle_dose_diary, pattern="^dose_diary$"))
+        
+        # Обработчики кнопок покупки премиум
+        application.add_handler(CallbackQueryHandler(handle_premium_buttons, pattern="^premium_"))
+        
+        # Обработчики платежей
+        async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            """Обработчик запроса на проверку платежа перед оплатой."""
+            query = update.pre_checkout_query
+            if query:
+                # Всегда подтверждаем платеж (в реальном приложении здесь можно добавить дополнительную проверку)
+                await query.answer(ok=True)
+                logging.info(f"✅ Pre-checkout query approved for user {query.from_user.id}, payload: {query.invoice_payload}")
+        
+        async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            """Обработчик успешного платежа."""
+            logging.info(f"💰 Получен успешный платеж от user {update.effective_user.id if update.effective_user else 'unknown'}")
             
-            if result:
-                premium_until = result["premium_until"]
-                subscription_days = result["subscription_days"]
-                
-                # Форматируем дату окончания для отображения
-                moscow_tz = timezone(timedelta(hours=3))
-                until_local = premium_until.astimezone(moscow_tz)
-                until_str = until_local.strftime("%d.%m.%Y")
-                
-                success_text = (
-                    f"✅ **Платеж успешно обработан!**\n\n"
-                    f"✨ Ваша премиум-подписка активирована на {subscription_days} дней!\n\n"
-                    f"📅 Подписка действует до: {until_str}\n\n"
-                    f"Теперь вам доступны все премиум-функции:\n"
-                    f"• 👶 Профиль ребенка\n"
-                    f"• 📊 Дневник лекарств\n"
-                    f"• 🚩 Красные флаги\n\n"
-                    f"Спасибо за поддержку! 💚"
-                )
-                
-                await update.message.reply_text(success_text, parse_mode="Markdown")
-                logging.info(f"✅ Премиум активирован для пользователя {user_id} до {until_str}")
-            else:
-                # Платеж не найден - это критическая ошибка
-                error_msg = (
-                    f"❌ Ошибка при обработке платежа.\n\n"
-                    f"Платеж получен, но не найден в базе данных.\n\n"
-                    f"**Не волнуйтесь!** Ваши деньги в безопасности.\n\n"
-                    f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
-                    f"• Ваш user_id: {user_id}\n"
-                    f"• Payload: {payment.invoice_payload}\n"
-                    f"• Payment ID: {payment.provider_payment_charge_id}\n\n"
-                    f"Мы активируем премиум вручную."
-                )
-                await update.message.reply_text(error_msg, parse_mode="Markdown")
-                logging.error(
-                    f"❌ КРИТИЧЕСКАЯ ОШИБКА: Платеж не найден в БД!\n"
-                    f"User ID: {user_id}\n"
-                    f"Payload: {payment.invoice_payload}\n"
-                    f"Provider Payment ID: {payment.provider_payment_charge_id}\n"
-                    f"Total Amount: {payment.total_amount}\n"
-                    f"Currency: {payment.currency}"
-                )
-        except Exception as e:
-            import traceback
-            error_details = traceback.format_exc()
-            logging.error(
-                f"❌ КРИТИЧЕСКАЯ ОШИБКА при обработке успешного платежа: {e}\n"
-                f"User ID: {user_id if 'user_id' in locals() else 'unknown'}\n"
-                f"Полный traceback:\n{error_details}"
-                f"Payload: {payment.invoice_payload if 'payment' in locals() else 'unknown'}",
-                exc_info=True
-            )
-            error_msg = (
-                f"❌ Произошла ошибка при активации премиума.\n\n"
-                f"**Не волнуйтесь!** Ваши деньги в безопасности.\n\n"
-                f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
-                f"• Ваш user_id: {user_id if 'user_id' in locals() else 'неизвестен'}\n"
-                f"• Payload: {payment.invoice_payload if 'payment' in locals() else 'неизвестен'}\n\n"
-                f"Мы активируем премиум вручную.\n\n"
-                f"Ошибка: {error_details}"
-            )
-            await update.message.reply_text(error_msg, parse_mode="Markdown")
-    
-    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    
-    # Команда для ручной активации премиума администратором
-    async def activate_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Ручная активация премиума администратором (формат: /activate_premium user_id days)."""
-        if not update.message:
-            return
-        
-        user_id = update.effective_user.id
-        
-        # Проверяем, является ли пользователь администратором
-        if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
-            await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-            return
-        
-        try:
-            # Парсим аргументы: /activate_premium user_id days
-            args = context.args
-            if len(args) < 2:
-                await update.message.reply_text(
-                    "Использование: /activate_premium <user_id> <days>\n\n"
-                    "Пример: /activate_premium 123456789 30"
-                )
+            if not update.message or not update.message.successful_payment:
+                logging.warning("⚠️ successful_payment_callback вызван, но нет update.message или successful_payment")
                 return
             
-            target_user_id = int(args[0])
-            days = int(args[1])
+            payment = update.message.successful_payment
+            user_id = update.message.from_user.id
             
-            # Активируем премиум
-            now = datetime.now(timezone.utc)
-            premium_until = now + timedelta(days=days)
-            await set_user_premium(target_user_id, True, premium_until)
+            logging.info(f"💰 Обработка платежа для user_id={user_id}, payload={payment.invoice_payload}, charge_id={payment.provider_payment_charge_id}")
             
-            # Проверяем, что премиум действительно активирован
-            is_premium = await is_user_premium(target_user_id)
-            if not is_premium:
-                logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не активирован для user_id={target_user_id} после вызова set_user_premium!")
-                await update.message.reply_text(
-                    f"⚠️ Ошибка: Премиум не активирован в БД.\n\n"
-                    f"Проверьте логи для деталей.\n"
-                    f"User ID: {target_user_id}"
-                )
-                return
-            
-            moscow_tz = timezone(timedelta(hours=3))
-            until_local = premium_until.astimezone(moscow_tz)
-            until_str = until_local.strftime("%d.%m.%Y")
-            
-            await update.message.reply_text(
-                f"✅ Премиум активирован!\n\n"
-                f"User ID: {target_user_id}\n"
-                f"Дней: {days}\n"
-                f"Действует до: {until_str}\n\n"
-                f"✅ Проверка: Премиум статус подтвержден в БД"
-            )
-            
-            # Отправляем уведомление пользователю
             try:
-                # Создаем кнопки для быстрого доступа
-                premium_keyboard = [
-                    [InlineKeyboardButton("🏠 На главную (/start)", callback_data="start_home")],
-                    [InlineKeyboardButton("👶 Профиль", callback_data="start_profile")]
-                ]
-                premium_markup = InlineKeyboardMarkup(premium_keyboard)
+                # Завершаем платеж и активируем премиум
+                result = await complete_payment(
+                    invoice_payload=payment.invoice_payload,
+                    provider_payment_charge_id=payment.provider_payment_charge_id
+                )
                 
-                await context.bot.send_message(
-                    chat_id=target_user_id,
-                    text=(
-                        f"✅ **Ваш премиум активирован администратором!**\n\n"
-                        f"✨ Премиум-подписка активна на {days} дней!\n\n"
+                if result:
+                    premium_until = result["premium_until"]
+                    subscription_days = result["subscription_days"]
+                    
+                    # Форматируем дату окончания для отображения
+                    moscow_tz = timezone(timedelta(hours=3))
+                    until_local = premium_until.astimezone(moscow_tz)
+                    until_str = until_local.strftime("%d.%m.%Y")
+                    
+                    success_text = (
+                        f"✅ **Платеж успешно обработан!**\n\n"
+                        f"✨ Ваша премиум-подписка активирована на {subscription_days} дней!\n\n"
                         f"📅 Подписка действует до: {until_str}\n\n"
                         f"Теперь вам доступны все премиум-функции:\n"
                         f"• 👶 Профиль ребенка\n"
                         f"• 📊 Дневник лекарств\n"
                         f"• 🚩 Красные флаги\n\n"
-                        f"💡 Используйте /start чтобы увидеть все премиум-функции!\n\n"
-                        f"Спасибо! 💚"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=premium_markup
+                        f"Спасибо за поддержку! 💚"
+                    )
+                    
+                    await update.message.reply_text(success_text, parse_mode="Markdown")
+                    logging.info(f"✅ Премиум активирован для пользователя {user_id} до {until_str}")
+                else:
+                    # Платеж не найден - это критическая ошибка
+                    error_msg = (
+                        f"❌ Ошибка при обработке платежа.\n\n"
+                        f"Платеж получен, но не найден в базе данных.\n\n"
+                        f"**Не волнуйтесь!** Ваши деньги в безопасности.\n\n"
+                        f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
+                        f"• Ваш user_id: {user_id}\n"
+                        f"• Payload: {payment.invoice_payload}\n"
+                        f"• Payment ID: {payment.provider_payment_charge_id}\n\n"
+                        f"Мы активируем премиум вручную."
+                    )
+                    await update.message.reply_text(error_msg, parse_mode="Markdown")
+                    logging.error(
+                        f"❌ КРИТИЧЕСКАЯ ОШИБКА: Платеж не найден в БД!\n"
+                        f"User ID: {user_id}\n"
+                        f"Payload: {payment.invoice_payload}\n"
+                        f"Provider Payment ID: {payment.provider_payment_charge_id}\n"
+                        f"Total Amount: {payment.total_amount}\n"
+                        f"Currency: {payment.currency}"
+                    )
+            except Exception as e:
+                import traceback
+                error_details = traceback.format_exc()
+                logging.error(
+                    f"❌ КРИТИЧЕСКАЯ ОШИБКА при обработке успешного платежа: {e}\n"
+                    f"User ID: {user_id if 'user_id' in locals() else 'unknown'}\n"
+                    f"Полный traceback:\n{error_details}"
+                    f"Payload: {payment.invoice_payload if 'payment' in locals() else 'unknown'}",
+                    exc_info=True
                 )
-            except Exception as notify_error:
-                logging.warning(f"Не удалось отправить уведомление пользователю {target_user_id}: {notify_error}")
-            
-            logging.info(f"Admin {user_id} manually activated premium for user {target_user_id} for {days} days - VERIFIED")
-            
-            logging.info(f"Admin {user_id} manually activated premium for user {target_user_id} for {days} days")
-            
-        except ValueError:
-            await update.message.reply_text("❌ Ошибка: user_id и days должны быть числами.")
-        except Exception as e:
-            logging.error(f"Error in activate_premium_command: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-    
-    application.add_handler(CommandHandler("activate_premium", activate_premium_command))
-    
-    # Команда для проверки статуса премиума
-    async def check_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Проверить статус премиум-подписки."""
-        if not update.message:
-            return
-        
-        user_id = update.effective_user.id
-        
-        try:
-            is_premium = await is_premium_user(user_id)
-            
-            if is_premium:
-                # Получаем информацию о подписке
-                import aiosqlite
-                async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
-                    db.row_factory = aiosqlite.Row
-                    async with db.execute(
-                        "SELECT premium_until FROM user_premium WHERE user_id = ?",
-                        (user_id,)
-                    ) as cursor:
-                        row = await cursor.fetchone()
-                        if row and row["premium_until"]:
-                            premium_until = datetime.fromisoformat(row["premium_until"])
-                            moscow_tz = timezone(timedelta(hours=3))
-                            until_local = premium_until.astimezone(moscow_tz)
-                            until_str = until_local.strftime("%d.%m.%Y %H:%M")
-                            
-                            await update.message.reply_text(
-                                f"✅ **У вас активна премиум-подписка!**\n\n"
-                                f"📅 Подписка действует до: {until_str}\n\n"
-                                f"Вам доступны все премиум-функции:\n"
-                                f"• 👶 Профиль ребенка\n"
-                                f"• 📊 Дневник лекарств\n"
-                                f"• 🚩 Красные флаги\n\n"
-                                f"Используйте /start чтобы увидеть все функции!",
-                                parse_mode="Markdown"
-                            )
-                        else:
-                            await update.message.reply_text(
-                                "✅ У вас активна премиум-подписка!\n\n"
-                                "Используйте /start чтобы увидеть все функции."
-                            )
-            else:
-                await update.message.reply_text(
-                    "❌ У вас нет активной премиум-подписки.\n\n"
-                    "Используйте /premium чтобы узнать больше о премиум-доступе."
+                error_msg = (
+                    f"❌ Произошла ошибка при активации премиума.\n\n"
+                    f"**Не волнуйтесь!** Ваши деньги в безопасности.\n\n"
+                    f"Пожалуйста, свяжитесь с поддержкой и укажите:\n"
+                    f"• Ваш user_id: {user_id if 'user_id' in locals() else 'неизвестен'}\n"
+                    f"• Payload: {payment.invoice_payload if 'payment' in locals() else 'неизвестен'}\n\n"
+                    f"Мы активируем премиум вручную.\n\n"
+                    f"Ошибка: {error_details}"
                 )
-        except Exception as e:
-            logging.error(f"Error in check_premium_command: {e}", exc_info=True)
-            await update.message.reply_text(
-                "❌ Произошла ошибка при проверке статуса. Попробуйте позже."
-            )
-    
-    application.add_handler(CommandHandler("check_premium", check_premium_command))
-    
-    application.add_handler(build_feedback_conversation())
-
-    # Красные флаги (ОРВИ + ЖКТ)
-    for h in build_redflags_handlers():
-        application.add_handler(h)
-
-    # Добавляем обработчик ошибок
-    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик ошибок."""
-        from telegram.error import Conflict
+                await update.message.reply_text(error_msg, parse_mode="Markdown")
         
-        # Ошибка Conflict (409) обычно происходит когда:
-        # 1. Другой экземпляр бота уже получает обновления
-        # 2. При переключении между webhook/polling
-        # 3. Telegram еще не закрыл старое соединение
-        # Библиотека автоматически обрабатывает это, но нужно время для синхронизации.
-        if isinstance(context.error, Conflict):
-            error_msg = str(context.error)
-            # Логируем на INFO, чтобы видеть проблему, но не паникуем
-            logging.info(f"⚠️ Conflict error (409): {error_msg}")
-            logging.info("⚠️ Это может быть из-за другого запущенного процесса бота или незакрытого соединения.")
-            logging.info("⚠️ Библиотека автоматически обработает это через несколько секунд.")
-            logging.info("⚠️ Если ошибка повторяется, попробуйте:")
-            logging.info("   1. Подождать 10-15 секунд и перезапустить бота")
-            logging.info("   2. Проверить, нет ли других запущенных процессов: ps aux | grep app.main")
-            return  # Не отправляем сообщение пользователю для этой ошибки
+        application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+        application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
         
-        # Обрабатываем сетевые ошибки и таймауты
-        from telegram.error import TimedOut, NetworkError
-        if isinstance(context.error, (TimedOut, NetworkError)):
-            error_type = type(context.error).__name__
-            logging.warning(f"⚠️ Сетевая ошибка/таймаут ({error_type}): {context.error}")
-            # Не отправляем сообщение пользователю - библиотека автоматически повторит запрос
-            return
-        
-        # Логируем информацию об update для отладки
-        update_info = "None"
-        if isinstance(update, Update):
-            if update.message:
-                update_info = f"Message from {update.message.from_user.id if update.message.from_user else 'unknown'}"
-            elif update.callback_query:
-                update_info = f"CallbackQuery from {update.callback_query.from_user.id if update.callback_query.from_user else 'unknown'}"
-        
-        logging.error(f"Exception while handling an update ({update_info}): {context.error}", exc_info=context.error)
-        
-        # Пытаемся отправить сообщение об ошибке пользователю, если это возможно
-        if isinstance(update, Update) and update.effective_message:
+        # Команда для ручной активации премиума администратором
+        async def activate_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Ручная активация премиума администратором (формат: /activate_premium user_id days)."""
+            if not update.message:
+                return
+            
+            user_id = update.effective_user.id
+            
+            # Проверяем, является ли пользователь администратором
+            if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+                await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+                return
+            
             try:
-                await update.effective_message.reply_text(
-                    "Произошла ошибка. Пожалуйста, попробуйте еще раз или используйте /start"
+                # Парсим аргументы: /activate_premium user_id days
+                args = context.args
+                if len(args) < 2:
+                    await update.message.reply_text(
+                        "Использование: /activate_premium <user_id> <days>\n\n"
+                        "Пример: /activate_premium 123456789 30"
+                    )
+                    return
+                
+                target_user_id = int(args[0])
+                days = int(args[1])
+                
+                # Активируем премиум
+                now = datetime.now(timezone.utc)
+                premium_until = now + timedelta(days=days)
+                await set_user_premium(target_user_id, True, premium_until)
+                
+                # Проверяем, что премиум действительно активирован
+                is_premium = await is_user_premium(target_user_id)
+                if not is_premium:
+                    logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не активирован для user_id={target_user_id} после вызова set_user_premium!")
+                    await update.message.reply_text(
+                        f"⚠️ Ошибка: Премиум не активирован в БД.\n\n"
+                        f"Проверьте логи для деталей.\n"
+                        f"User ID: {target_user_id}"
+                    )
+                    return
+                
+                moscow_tz = timezone(timedelta(hours=3))
+                until_local = premium_until.astimezone(moscow_tz)
+                until_str = until_local.strftime("%d.%m.%Y")
+                
+                await update.message.reply_text(
+                    f"✅ Премиум активирован!\n\n"
+                    f"User ID: {target_user_id}\n"
+                    f"Дней: {days}\n"
+                    f"Действует до: {until_str}\n\n"
+                    f"✅ Проверка: Премиум статус подтвержден в БД"
                 )
-            except:
-                pass
-    
-    application.add_error_handler(error_handler)
+                
+                # Отправляем уведомление пользователю
+                try:
+                    # Создаем кнопки для быстрого доступа
+                    premium_keyboard = [
+                        [InlineKeyboardButton("🏠 На главную (/start)", callback_data="start_home")],
+                        [InlineKeyboardButton("👶 Профиль", callback_data="start_profile")]
+                    ]
+                    premium_markup = InlineKeyboardMarkup(premium_keyboard)
+                    
+                    await context.bot.send_message(
+                        chat_id=target_user_id,
+                        text=(
+                            f"✅ **Ваш премиум активирован администратором!**\n\n"
+                            f"✨ Премиум-подписка активна на {days} дней!\n\n"
+                            f"📅 Подписка действует до: {until_str}\n\n"
+                            f"Теперь вам доступны все премиум-функции:\n"
+                            f"• 👶 Профиль ребенка\n"
+                            f"• 📊 Дневник лекарств\n"
+                            f"• 🚩 Красные флаги\n\n"
+                            f"💡 Используйте /start чтобы увидеть все премиум-функции!\n\n"
+                            f"Спасибо! 💚"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=premium_markup
+                    )
+                except Exception as notify_error:
+                    logging.warning(f"Не удалось отправить уведомление пользователю {target_user_id}: {notify_error}")
+                
+                logging.info(f"Admin {user_id} manually activated premium for user {target_user_id} for {days} days - VERIFIED")
+                
+                logging.info(f"Admin {user_id} manually activated premium for user {target_user_id} for {days} days")
+                
+            except ValueError:
+                await update.message.reply_text("❌ Ошибка: user_id и days должны быть числами.")
+            except Exception as e:
+                logging.error(f"Error in activate_premium_command: {e}", exc_info=True)
+                await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        
+        application.add_handler(CommandHandler("activate_premium", activate_premium_command))
+        
+        # Команда для проверки статуса премиума
+        async def check_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Проверить статус премиум-подписки."""
+            if not update.message:
+                return
+            
+            user_id = update.effective_user.id
+            
+            try:
+                is_premium = await is_premium_user(user_id)
+                
+                if is_premium:
+                    # Получаем информацию о подписке
+                    import aiosqlite
+                    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+                        db.row_factory = aiosqlite.Row
+                        async with db.execute(
+                            "SELECT premium_until FROM user_premium WHERE user_id = ?",
+                            (user_id,)
+                        ) as cursor:
+                            row = await cursor.fetchone()
+                            if row and row["premium_until"]:
+                                premium_until = datetime.fromisoformat(row["premium_until"])
+                                moscow_tz = timezone(timedelta(hours=3))
+                                until_local = premium_until.astimezone(moscow_tz)
+                                until_str = until_local.strftime("%d.%m.%Y %H:%M")
+                                
+                                await update.message.reply_text(
+                                    f"✅ **У вас активна премиум-подписка!**\n\n"
+                                    f"📅 Подписка действует до: {until_str}\n\n"
+                                    f"Вам доступны все премиум-функции:\n"
+                                    f"• 👶 Профиль ребенка\n"
+                                    f"• 📊 Дневник лекарств\n"
+                                    f"• 🚩 Красные флаги\n\n"
+                                    f"Используйте /start чтобы увидеть все функции!",
+                                    parse_mode="Markdown"
+                                )
+                            else:
+                                await update.message.reply_text(
+                                    "✅ У вас активна премиум-подписка!\n\n"
+                                    "Используйте /start чтобы увидеть все функции."
+                                )
+                else:
+                    await update.message.reply_text(
+                        "❌ У вас нет активной премиум-подписки.\n\n"
+                        "Используйте /premium чтобы узнать больше о премиум-доступе."
+                    )
+            except Exception as e:
+                logging.error(f"Error in check_premium_command: {e}", exc_info=True)
+                await update.message.reply_text(
+                    "❌ Произошла ошибка при проверке статуса. Попробуйте позже."
+                )
+        
+        application.add_handler(CommandHandler("check_premium", check_premium_command))
+        
+        application.add_handler(build_feedback_conversation())
 
-    # Добавляем логирование перед запуском polling
-    async def log_update_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Логируем получение обновлений для отладки."""
-        if update.message:
-            logging.info(f"📨 Update received: message from {update.message.from_user.id if update.message.from_user else 'unknown'}: {update.message.text}")
-        elif update.callback_query:
-            logging.info(f"🔘 Update received: callback_query from {update.callback_query.from_user.id if update.callback_query.from_user else 'unknown'}: {update.callback_query.data}")
-        # Не обрабатываем, просто логируем - другие обработчики обработают
-    
-    # Добавляем в конец, чтобы не мешать командам
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_update_received))
-    application.add_handler(CallbackQueryHandler(log_update_received, pattern=".*"))
+        # Красные флаги (ОРВИ + ЖКТ)
+        for h in build_redflags_handlers():
+            application.add_handler(h)
 
-    print("Бот запущен... (polling)")
-    logging.info("Bot is ready to receive updates")
-    application.run_polling(drop_pending_updates=True)
+        # Добавляем обработчик ошибок
+        async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+            """Обработчик ошибок."""
+            from telegram.error import Conflict
+            
+            # Ошибка Conflict (409) обычно происходит когда:
+            # 1. Другой экземпляр бота уже получает обновления
+            # 2. При переключении между webhook/polling
+            # 3. Telegram еще не закрыл старое соединение
+            # Библиотека автоматически обрабатывает это, но нужно время для синхронизации.
+            if isinstance(context.error, Conflict):
+                error_msg = str(context.error)
+                # Логируем на INFO, чтобы видеть проблему, но не паникуем
+                logging.info(f"⚠️ Conflict error (409): {error_msg}")
+                logging.info("⚠️ Это может быть из-за другого запущенного процесса бота или незакрытого соединения.")
+                logging.info("⚠️ Библиотека автоматически обработает это через несколько секунд.")
+                logging.info("⚠️ Если ошибка повторяется, попробуйте:")
+                logging.info("   1. Подождать 10-15 секунд и перезапустить бота")
+                logging.info("   2. Проверить, нет ли других запущенных процессов: ps aux | grep app.main")
+                return  # Не отправляем сообщение пользователю для этой ошибки
+            
+            # Обрабатываем сетевые ошибки и таймауты
+            from telegram.error import TimedOut, NetworkError
+            if isinstance(context.error, (TimedOut, NetworkError)):
+                error_type = type(context.error).__name__
+                logging.warning(f"⚠️ Сетевая ошибка/таймаут ({error_type}): {context.error}")
+                # Не отправляем сообщение пользователю - библиотека автоматически повторит запрос
+                return
+            
+            # Логируем информацию об update для отладки
+            update_info = "None"
+            if isinstance(update, Update):
+                if update.message:
+                    update_info = f"Message from {update.message.from_user.id if update.message.from_user else 'unknown'}"
+                elif update.callback_query:
+                    update_info = f"CallbackQuery from {update.callback_query.from_user.id if update.callback_query.from_user else 'unknown'}"
+            
+            logging.error(f"Exception while handling an update ({update_info}): {context.error}", exc_info=context.error)
+            
+            # Пытаемся отправить сообщение об ошибке пользователю, если это возможно
+            if isinstance(update, Update) and update.effective_message:
+                try:
+                    await update.effective_message.reply_text(
+                        "Произошла ошибка. Пожалуйста, попробуйте еще раз или используйте /start"
+                    )
+                except:
+                    pass
+        
+        application.add_error_handler(error_handler)
+
+        # Добавляем логирование перед запуском polling
+        async def log_update_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Логируем получение обновлений для отладки."""
+            if update.message:
+                logging.info(f"📨 Update received: message from {update.message.from_user.id if update.message.from_user else 'unknown'}: {update.message.text}")
+            elif update.callback_query:
+                logging.info(f"🔘 Update received: callback_query from {update.callback_query.from_user.id if update.callback_query.from_user else 'unknown'}: {update.callback_query.data}")
+            # Не обрабатываем, просто логируем - другие обработчики обработают
+        
+        # Добавляем в конец, чтобы не мешать командам
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_update_received))
+        application.add_handler(CallbackQueryHandler(log_update_received, pattern=".*"))
+
+        print("Бот запущен... (polling)")
+        logging.info("Bot is ready to receive updates")
+        application.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        logging.error("=" * 60)
+        logging.error("❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ БОТА:")
+        logging.error(f"Тип ошибки: {type(e).__name__}")
+        logging.error(f"Сообщение: {str(e)}")
+        logging.error(f"Полный traceback:\n{error_details}")
+        logging.error("=" * 60)
+        raise  # Пробрасываем ошибку, чтобы Docker увидел проблему
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("🛑 Бот остановлен пользователем")
+    except Exception as e:
+        import traceback
+        logging.error(f"❌ Фатальная ошибка: {e}")
+        logging.error(traceback.format_exc())
+        sys.exit(1)
