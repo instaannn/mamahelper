@@ -237,18 +237,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Для первого визита используем Markdown для форматирования
+        # Отправляем сообщение с обработкой таймаутов
         try:
+            # Пытаемся отправить с Markdown для первого визита
             if is_first_visit:
-                await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
+                try:
+                    await asyncio.wait_for(
+                        update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown"),
+                        timeout=10.0
+                    )
+                    logging.debug(f"✅ Сообщение отправлено с Markdown для user {user_id}")
+                except asyncio.TimeoutError:
+                    logging.warning(f"⚠️ Таймаут при отправке с Markdown для user {user_id}, пробуем без форматирования")
+                    # Пробуем без Markdown
+                    await asyncio.wait_for(
+                        update.message.reply_text(welcome_text.replace("**", "").replace("*", ""), reply_markup=reply_markup),
+                        timeout=10.0
+                    )
+                    logging.debug(f"✅ Сообщение отправлено без форматирования для user {user_id}")
             else:
-                await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+                await asyncio.wait_for(
+                    update.message.reply_text(welcome_text, reply_markup=reply_markup),
+                    timeout=10.0
+                )
+                logging.debug(f"✅ Сообщение отправлено для user {user_id}")
         except Exception as send_error:
             # Обрабатываем таймауты и другие ошибки отправки
             from telegram.error import TimedOut
-            if isinstance(send_error, TimedOut):
+            if isinstance(send_error, (TimedOut, asyncio.TimeoutError)):
                 logging.warning(f"⚠️ Таймаут при отправке сообщения пользователю {update.effective_user.id}, но сообщение может быть доставлено")
-                # Не пробрасываем ошибку дальше, так как сообщение может быть доставлено
+                # Пробуем отправить простое сообщение
+                try:
+                    await asyncio.wait_for(
+                        update.message.reply_text("Привет! 👋 Используйте кнопки ниже для работы с ботом.", reply_markup=reply_markup),
+                        timeout=5.0
+                    )
+                    logging.info(f"✅ Отправлено упрощенное сообщение для user {user_id}")
+                except Exception:
+                    logging.error(f"❌ Не удалось отправить даже упрощенное сообщение для user {user_id}")
             else:
                 # Для других ошибок пробрасываем дальше
                 raise
