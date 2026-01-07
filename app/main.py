@@ -96,36 +96,45 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"Received /start command from user {update.effective_user.id}")
     try:
-        # Отслеживаем взаимодействие пользователя (не критично, если не получится)
-        try:
-            await track_user_interaction(update.effective_user.id)
-        except Exception as track_error:
-            logging.warning(f"⚠️ Ошибка при отслеживании взаимодействия пользователя {update.effective_user.id}: {track_error}")
-            # Продолжаем выполнение, это не критично
-        
         user = update.effective_user
         # Используем имя профиля (first_name), если нет - username, если нет - "друг"
         user_name = user.first_name or user.username or "друг"
         
-        # Проверяем, есть ли уже профиль
-        profile = await get_child_profile(user.id)
+        # Оптимизация: выполняем все проверки параллельно для ускорения
+        import asyncio
+        from app.storage import has_dose_events
+        
+        # Запускаем все проверки параллельно
+        profile_task = asyncio.create_task(get_child_profile(user.id))
+        events_task = asyncio.create_task(has_dose_events(user.id))
+        premium_task = asyncio.create_task(is_premium_user(user.id))
+        track_task = asyncio.create_task(track_user_interaction(user.id))
+        
+        # Ждем результаты
+        profile, has_events, is_premium, _ = await asyncio.gather(
+            profile_task,
+            events_task,
+            premium_task,
+            track_task,
+            return_exceptions=True
+        )
+        
+        # Обрабатываем исключения
+        if isinstance(profile, Exception):
+            logging.warning(f"⚠️ Ошибка при получении профиля для user {user.id}: {profile}")
+            profile = None
+        if isinstance(has_events, Exception):
+            logging.warning(f"⚠️ Ошибка при проверке записей для user {user.id}: {has_events}")
+            has_events = False
+        if isinstance(is_premium, Exception):
+            logging.warning(f"⚠️ Ошибка при проверке премиума для user {user.id}: {is_premium}")
+            is_premium = False
+        
         has_profile = profile is not None
         if has_profile:
             logging.info(f"User {user.id} has profile: name={profile.child_name}, weight={profile.child_weight_kg}, age={profile.child_age_months}")
         else:
             logging.info(f"User {user.id} has no profile")
-        
-        # Проверяем, первый ли это визит (нет профиля и нет записей в дневнике)
-        from app.storage import has_dose_events
-        has_events = await has_dose_events(user.id)
-        
-        # Проверяем премиум-статус (подписка на бота, не Telegram Premium)
-        try:
-            is_premium = await is_premium_user(user.id)
-        except Exception as premium_check_error:
-            logging.error(f"❌ Ошибка при проверке премиум-статуса для user {user.id}: {premium_check_error}", exc_info=True)
-            # В случае ошибки считаем, что премиум нет
-            is_premium = False
         
         # Если нет профиля и нет записей - это первый визит
         # Но если премиум-статус True, возможно остались старые данные - сбрасываем
@@ -247,7 +256,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик inline кнопок из команды /start."""
     query = update.callback_query
-    await query.answer()  # Убираем "часики" у кнопки
+    
+    # Показываем индикатор загрузки сразу
+    await query.answer(text="⏳ Загрузка...", show_alert=False)
     
     if query.data == "start_premium_info":
         # Информация о премиум
@@ -273,7 +284,15 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
         premium_markup = InlineKeyboardMarkup(premium_keyboard)
         
-        await query.message.reply_text(premium_text, reply_markup=premium_markup)
+        try:
+            await query.message.reply_text(premium_text, reply_markup=premium_markup)
+        except Exception as send_error:
+            from telegram.error import TimedOut
+            if isinstance(send_error, TimedOut):
+                logging.warning(f"⚠️ Таймаут при отправке сообщения пользователю {query.from_user.id}, но сообщение может быть доставлено")
+            else:
+                logging.error(f"❌ Ошибка при отправке сообщения пользователю {query.from_user.id}: {send_error}")
+                raise
     
     elif query.data == "start_help":
         # Показываем все команды
@@ -302,7 +321,7 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     elif query.data == "start_home":
         # Вернуться на главную (показать приветственное сообщение)
-        await query.answer()
+        # Индикатор загрузки уже показан выше
         # Создаем fake message для вызова start
         from datetime import datetime
         
@@ -317,22 +336,36 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
                 self._original = original_msg
             
             async def reply_text(self, *args, **kwargs):
-                return await self._original.reply_text(*args, **kwargs)
+                try:
+                    return await self._original.reply_text(*args, **kwargs)
+                except Exception as send_error:
+                    from telegram.error import TimedOut
+                    if isinstance(send_error, TimedOut):
+                        logging.warning(f"⚠️ Таймаут при отправке сообщения пользователю {self.from_user.id}, но сообщение может быть доставлено")
+                    else:
+                        raise
             
             def __getattr__(self, name):
                 return getattr(self._original, name)
         
         home_message = HomeMessage(query.message, query.from_user)
         home_update = Update(update_id=update.update_id + 40000, message=home_message)
-        await start(home_update, context)
+        try:
+            await start(home_update, context)
+        except Exception as e:
+            from telegram.error import TimedOut
+            if isinstance(e, TimedOut):
+                logging.warning(f"⚠️ Таймаут при обработке команды /start для пользователя {query.from_user.id}, но сообщение может быть доставлено")
+            else:
+                raise
     
     elif query.data == "start_calculate":
         # Для кнопки "Рассчитать дозу" - просто отвечаем, обработка в ConversationHandler
-        await query.answer()
+        await query.answer(text="⏳ Загрузка...", show_alert=False)
     
     elif query.data == "start_profile":
         # Меню профиля для премиум-пользователей
-        await query.answer()
+        await query.answer(text="⏳ Загрузка...", show_alert=False)
         profile_keyboard = [
             [InlineKeyboardButton("👶 Посмотреть профили", callback_data="profile_show")],
             [InlineKeyboardButton("👶 Создать/добавить профиль", callback_data="start_create_profile")]
@@ -346,7 +379,7 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     elif query.data == "start_redflags_orvi":
         # Красные флаги ОРВИ
-        await query.answer()
+        await query.answer(text="⏳ Загрузка...", show_alert=False)
         from app.handlers.redflags import REDFLAGS_ORVI_TEXT
         redflags_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
@@ -355,7 +388,7 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     elif query.data == "start_redflags_gi":
         # Красные флаги ЖКТ
-        await query.answer()
+        await query.answer(text="⏳ Загрузка...", show_alert=False)
         from app.handlers.redflags import REDFLAGS_GI_TEXT
         redflags_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
@@ -430,7 +463,7 @@ async def handle_profile_buttons(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_dose_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик сохранения приема лекарства в дневник."""
     query = update.callback_query
-    await query.answer()
+    await query.answer(text="⏳ Сохранение...", show_alert=False)
     
     user = query.from_user
     user_id = user.id
@@ -596,7 +629,7 @@ async def handle_dose_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_dose_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик просмотра дневника приема лекарств."""
     query = update.callback_query
-    await query.answer()
+    await query.answer(text="⏳ Загрузка дневника...", show_alert=False)
     
     user = query.from_user
     user_id = user.id
@@ -765,7 +798,7 @@ async def handle_dose_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок покупки премиум - отправка инвойсов."""
     query = update.callback_query
-    await query.answer()  # Убираем "часики" у кнопки
+    await query.answer(text="⏳ Подготовка платежа...", show_alert=False)
     
     if not PROVIDER_TOKEN:
         await query.message.reply_text(
@@ -1337,7 +1370,16 @@ def main():
         logging.warning("Продолжаем запуск через 3 секунды...")
         time.sleep(3)
 
-    application = Application.builder().token(API_TOKEN).post_init(post_init).build()
+    # Оптимизированные таймауты для HTTP запросов к Telegram API
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=15.0,  # Оптимальный таймаут чтения (было 30, уменьшаем для быстрой реакции)
+        write_timeout=15.0,  # Оптимальный таймаут записи
+        connect_timeout=5.0,  # Таймаут подключения
+    )
+    
+    application = Application.builder().token(API_TOKEN).request(request).post_init(post_init).build()
     
     # Команды (должны быть ПЕРВЫМИ, чтобы не перехватывались другими обработчиками)
     application.add_handler(CommandHandler("start", start))
