@@ -23,7 +23,7 @@ from app.storage import (
     has_notification_been_sent, mark_notification_sent,
     save_payment, complete_payment,
     track_user_interaction, get_bot_statistics,
-    disable_expired_premium_subscriptions
+    disable_expired_premium_subscriptions, DB_PATH
 )
 from app.utils import is_premium_user
 
@@ -1434,6 +1434,17 @@ def main():
             premium_until = now + timedelta(days=days)
             await set_user_premium(target_user_id, True, premium_until)
             
+            # Проверяем, что премиум действительно активирован
+            is_premium = await is_user_premium(target_user_id)
+            if not is_premium:
+                logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не активирован для user_id={target_user_id} после вызова set_user_premium!")
+                await update.message.reply_text(
+                    f"⚠️ Ошибка: Премиум не активирован в БД.\n\n"
+                    f"Проверьте логи для деталей.\n"
+                    f"User ID: {target_user_id}"
+                )
+                return
+            
             moscow_tz = timezone(timedelta(hours=3))
             until_local = premium_until.astimezone(moscow_tz)
             until_str = until_local.strftime("%d.%m.%Y")
@@ -1442,11 +1453,19 @@ def main():
                 f"✅ Премиум активирован!\n\n"
                 f"User ID: {target_user_id}\n"
                 f"Дней: {days}\n"
-                f"Действует до: {until_str}"
+                f"Действует до: {until_str}\n\n"
+                f"✅ Проверка: Премиум статус подтвержден в БД"
             )
             
             # Отправляем уведомление пользователю
             try:
+                # Создаем кнопки для быстрого доступа
+                premium_keyboard = [
+                    [InlineKeyboardButton("🏠 На главную (/start)", callback_data="start_home")],
+                    [InlineKeyboardButton("👶 Профиль", callback_data="start_profile")]
+                ]
+                premium_markup = InlineKeyboardMarkup(premium_keyboard)
+                
                 await context.bot.send_message(
                     chat_id=target_user_id,
                     text=(
@@ -1457,12 +1476,16 @@ def main():
                         f"• 👶 Профиль ребенка\n"
                         f"• 📊 Дневник лекарств\n"
                         f"• 🚩 Красные флаги\n\n"
+                        f"💡 Используйте /start чтобы увидеть все премиум-функции!\n\n"
                         f"Спасибо! 💚"
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=premium_markup
                 )
             except Exception as notify_error:
                 logging.warning(f"Не удалось отправить уведомление пользователю {target_user_id}: {notify_error}")
+            
+            logging.info(f"Admin {user_id} manually activated premium for user {target_user_id} for {days} days - VERIFIED")
             
             logging.info(f"Admin {user_id} manually activated premium for user {target_user_id} for {days} days")
             
@@ -1473,6 +1496,61 @@ def main():
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     
     application.add_handler(CommandHandler("activate_premium", activate_premium_command))
+    
+    # Команда для проверки статуса премиума
+    async def check_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Проверить статус премиум-подписки."""
+        if not update.message:
+            return
+        
+        user_id = update.effective_user.id
+        
+        try:
+            is_premium = await is_premium_user(user_id)
+            
+            if is_premium:
+                # Получаем информацию о подписке
+                import aiosqlite
+                async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+                    db.row_factory = aiosqlite.Row
+                    async with db.execute(
+                        "SELECT premium_until FROM user_premium WHERE user_id = ?",
+                        (user_id,)
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                        if row and row["premium_until"]:
+                            premium_until = datetime.fromisoformat(row["premium_until"])
+                            moscow_tz = timezone(timedelta(hours=3))
+                            until_local = premium_until.astimezone(moscow_tz)
+                            until_str = until_local.strftime("%d.%m.%Y %H:%M")
+                            
+                            await update.message.reply_text(
+                                f"✅ **У вас активна премиум-подписка!**\n\n"
+                                f"📅 Подписка действует до: {until_str}\n\n"
+                                f"Вам доступны все премиум-функции:\n"
+                                f"• 👶 Профиль ребенка\n"
+                                f"• 📊 Дневник лекарств\n"
+                                f"• 🚩 Красные флаги\n\n"
+                                f"Используйте /start чтобы увидеть все функции!",
+                                parse_mode="Markdown"
+                            )
+                        else:
+                            await update.message.reply_text(
+                                "✅ У вас активна премиум-подписка!\n\n"
+                                "Используйте /start чтобы увидеть все функции."
+                            )
+            else:
+                await update.message.reply_text(
+                    "❌ У вас нет активной премиум-подписки.\n\n"
+                    "Используйте /premium чтобы узнать больше о премиум-доступе."
+                )
+        except Exception as e:
+            logging.error(f"Error in check_premium_command: {e}", exc_info=True)
+            await update.message.reply_text(
+                "❌ Произошла ошибка при проверке статуса. Попробуйте позже."
+            )
+    
+    application.add_handler(CommandHandler("check_premium", check_premium_command))
     
     application.add_handler(build_feedback_conversation())
 

@@ -1,6 +1,9 @@
 # app/storage.py
 import json
 import aiosqlite
+import asyncio
+import logging
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
@@ -14,6 +17,14 @@ DATA_DIR.mkdir(exist_ok=True)
 
 FEEDBACK_FILE = DATA_DIR / "feedback.jsonl"
 DB_PATH = DATA_DIR / "bot.db"
+
+# ---------- Настройки БД ----------
+# Timeout для подключений к БД (в секундах)
+DB_TIMEOUT = 30.0
+# Максимальное количество попыток при блокировке БД
+MAX_RETRIES = 5
+# Начальная задержка между попытками (в секундах)
+RETRY_DELAY = 0.1
 
 # ---------- Хранение записей дневника в БД ----------
 # Теперь все записи сохраняются в таблице dose_events в SQLite
@@ -200,7 +211,11 @@ def save_feedback(text: str, meta: dict) -> None:
 # ---------- База данных (SQLite) ----------
 async def init_db() -> None:
     """Инициализация БД: создание таблиц при первом запуске."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT) as db:
+        # Включаем WAL mode для лучшей производительности и меньших блокировок
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=30000")  # 30 секунд timeout
+        await db.commit()
         # Таблица профилей детей
         await db.execute("""
             CREATE TABLE IF NOT EXISTS child_profiles (
@@ -510,77 +525,166 @@ async def delete_child_profile(user_id: int, profile_id: Optional[int] = None) -
 # ---------- Премиум-подписка пользователей ----------
 async def is_user_premium(user_id: int) -> bool:
     """Проверить, есть ли у пользователя премиум-подписка бота."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row:
+    # Используем retry логику для подключения
+    for attempt in range(MAX_RETRIES):
+        db = None
+        try:
+            db = await _db_connect_with_retry()
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    await db.close()
+                    return False
+                
+                # Проверяем is_premium (может быть 0, 1, или булево значение)
+                is_premium_value = row["is_premium"]
+                # Преобразуем в булево значение (SQLite хранит как INTEGER: 0 или 1)
+                is_premium_bool = bool(int(is_premium_value)) if is_premium_value is not None else False
+                
+                # Проверяем, не истекла ли подписка
+                if is_premium_bool:
+                    if row["premium_until"]:
+                        premium_until = datetime.fromisoformat(row["premium_until"])
+                        if datetime.now(timezone.utc) > premium_until:
+                            # Подписка истекла - обновляем статус напрямую в БД
+                            now = datetime.now(timezone.utc)
+                            await db.execute("""
+                                UPDATE user_premium
+                                SET is_premium = 0,
+                                    updated_at = ?
+                                WHERE user_id = ?
+                            """, (now.isoformat(), user_id))
+                            await db.commit()
+                            await db.close()
+                            return False
+                    await db.close()
+                    return True
+                
+                await db.close()
                 return False
-            
-            # Проверяем, не истекла ли подписка
-            if row["is_premium"]:
-                if row["premium_until"]:
-                    premium_until = datetime.fromisoformat(row["premium_until"])
-                    if datetime.now(timezone.utc) > premium_until:
-                        # Подписка истекла - обновляем статус напрямую в БД
-                        now = datetime.now(timezone.utc)
-                        await db.execute("""
-                            UPDATE user_premium
-                            SET is_premium = 0,
-                                updated_at = ?
-                            WHERE user_id = ?
-                        """, (now.isoformat(), user_id))
-                        await db.commit()
-                        return False
-                return True
-            
-            return False
+        except aiosqlite.OperationalError as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)
+                logging.warning(f"⚠️ БД заблокирована при проверке премиума для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logging.error(f"❌ Ошибка БД при проверке премиума для user_id={user_id}: {e}")
+                raise
+        except Exception as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            logging.error(f"❌ Неожиданная ошибка при проверке премиума для user_id={user_id}: {e}", exc_info=True)
+            raise
+    
+    # Если все попытки исчерпаны
+    logging.error(f"❌ Не удалось проверить премиум для user_id={user_id} после {MAX_RETRIES} попыток")
+    return False
 
 async def set_user_premium(user_id: int, is_premium: bool, premium_until: Optional[datetime] = None) -> None:
     """Установить премиум-статус пользователя."""
     now = datetime.now(timezone.utc)
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Проверяем, есть ли уже запись
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT user_id FROM user_premium WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            existing = await cursor.fetchone()
+    # Используем retry логику для подключения
+    for attempt in range(MAX_RETRIES):
+        db = None
+        try:
+            db = await _db_connect_with_retry()
+            db.row_factory = aiosqlite.Row
             
-            if existing:
-                # Обновляем существующую запись
-                await db.execute("""
-                    UPDATE user_premium
-                    SET is_premium = ?,
-                        premium_until = ?,
-                        updated_at = ?
-                    WHERE user_id = ?
-                """, (
-                    1 if is_premium else 0,
-                    premium_until.isoformat() if premium_until else None,
-                    now.isoformat(),
-                    user_id,
-                ))
+            # Проверяем, есть ли уже запись
+            async with db.execute(
+                "SELECT user_id FROM user_premium WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                existing = await cursor.fetchone()
+                
+                if existing:
+                    # Обновляем существующую запись
+                    await db.execute("""
+                        UPDATE user_premium
+                        SET is_premium = ?,
+                            premium_until = ?,
+                            updated_at = ?
+                        WHERE user_id = ?
+                    """, (
+                        1 if is_premium else 0,
+                        premium_until.isoformat() if premium_until else None,
+                        now.isoformat(),
+                        user_id,
+                    ))
+                else:
+                    # Создаем новую запись
+                    await db.execute("""
+                        INSERT INTO user_premium
+                        (user_id, is_premium, premium_until, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        user_id,
+                        1 if is_premium else 0,
+                        premium_until.isoformat() if premium_until else None,
+                        now.isoformat(),
+                        now.isoformat(),
+                    ))
+            
+            await db.commit()
+            
+            # Проверяем, что данные действительно сохранились
+            async with db.execute(
+                "SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?",
+                (user_id,)
+            ) as verify_cursor:
+                verify_row = await verify_cursor.fetchone()
+                if verify_row:
+                    saved_is_premium = bool(int(verify_row["is_premium"])) if verify_row["is_premium"] is not None else False
+                    saved_premium_until = verify_row["premium_until"]
+                    logging.info(
+                        f"✅ Премиум сохранен для user_id={user_id}: "
+                        f"is_premium={saved_is_premium}, premium_until={saved_premium_until}"
+                    )
+                    if not saved_is_premium and is_premium:
+                        logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не сохранился для user_id={user_id}!")
+                        raise ValueError(f"Премиум не сохранился в БД для user_id={user_id}")
+                else:
+                    logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Запись не найдена после сохранения для user_id={user_id}!")
+                    raise ValueError(f"Запись не найдена после сохранения для user_id={user_id}")
+            
+            await db.close()
+            return
+        except aiosqlite.OperationalError as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)
+                logging.warning(f"⚠️ БД заблокирована при установке премиума для user_id={user_id}, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                await asyncio.sleep(delay)
+                continue
             else:
-                # Создаем новую запись
-                await db.execute("""
-                    INSERT INTO user_premium
-                    (user_id, is_premium, premium_until, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (
-                    user_id,
-                    1 if is_premium else 0,
-                    premium_until.isoformat() if premium_until else None,
-                    now.isoformat(),
-                    now.isoformat(),
-                ))
-        
-        await db.commit()
+                logging.error(f"❌ Ошибка БД при установке премиума для user_id={user_id}: {e}")
+                raise
+        except Exception as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            logging.error(f"❌ Неожиданная ошибка при установке премиума для user_id={user_id}: {e}", exc_info=True)
+            raise
 
 # ---------- Отслеживание пользователей ----------
 async def track_user_interaction(user_id: int) -> None:
@@ -817,6 +921,29 @@ async def save_payment(
             logging.error(f"❌ Ошибка при сохранении платежа в БД: {e}", exc_info=True)
             raise
 
+async def _db_connect_with_retry():
+    """
+    Подключиться к БД с повторными попытками при блокировке.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            db = await aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT)
+            # Включаем WAL mode для лучшей производительности и меньших блокировок
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.commit()
+            return db
+        except aiosqlite.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)  # Экспоненциальная задержка
+                logging.warning(f"⚠️ БД заблокирована, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                raise
+        except Exception as e:
+            logging.error(f"❌ Ошибка подключения к БД: {e}")
+            raise
+
 async def complete_payment(
     invoice_payload: str,
     provider_payment_charge_id: str
@@ -834,15 +961,19 @@ async def complete_payment(
     """
     now = datetime.now(timezone.utc)
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        
-        # Сначала пытаемся найти платеж со статусом 'pending'
-        async with db.execute("""
-            SELECT user_id, subscription_days, status
-            FROM payments
-            WHERE invoice_payload = ? AND status = 'pending'
-        """, (invoice_payload,)) as cursor:
+    # Используем retry логику для всех операций
+    for attempt in range(MAX_RETRIES):
+        db = None
+        try:
+            db = await _db_connect_with_retry()
+            db.row_factory = aiosqlite.Row
+            
+            # Сначала пытаемся найти платеж со статусом 'pending'
+            async with db.execute("""
+                SELECT user_id, subscription_days, status
+                FROM payments
+                WHERE invoice_payload = ? AND status = 'pending'
+            """, (invoice_payload,)) as cursor:
             row = await cursor.fetchone()
             
             # Если не нашли pending, проверяем, может быть платеж уже обработан
@@ -865,23 +996,39 @@ async def complete_payment(
                         row = row2  # Используем найденную запись
                     else:
                         logging.error(f"❌ Платеж с payload '{invoice_payload}' не найден в БД вообще!")
-                        # Пытаемся извлечь user_id из payload (формат: premium_1month_{user_id}_{timestamp} или premium_3months_{user_id}_{timestamp})
+                        # Пытаемся извлечь user_id из payload
+                        # Форматы: premium_1month_{user_id}_{timestamp} или premium1month{user_id}{timestamp}
                         try:
-                            parts = invoice_payload.split('_')
-                            if len(parts) >= 3:
-                                user_id_str = parts[2]
-                                user_id = int(user_id_str)
-                                
-                                # Определяем тип подписки из payload
-                                if '1month' in invoice_payload:
-                                    subscription_days = 30
-                                    amount = 99
-                                elif '3months' in invoice_payload:
-                                    subscription_days = 90
-                                    amount = 270
-                                else:
-                                    logging.error(f"❌ Не удалось определить тип подписки из payload: {invoice_payload}")
-                                    return None
+                            user_id = None
+                            subscription_days = None
+                            amount = None
+                            
+                            # Пробуем формат с подчеркиваниями: premium_1month_{user_id}_{timestamp}
+                            if '_' in invoice_payload:
+                                parts = invoice_payload.split('_')
+                                if len(parts) >= 3:
+                                    user_id_str = parts[2]
+                                    user_id = int(user_id_str)
+                            else:
+                                # Формат без подчеркиваний: premium1month{user_id}{timestamp}
+                                # Ищем паттерн: premium + 1month/3months + число (user_id)
+                                match = re.search(r'premium(1month|3months)(\d+)', invoice_payload)
+                                if match:
+                                    user_id = int(match.group(2))
+                            
+                            if user_id is None:
+                                raise ValueError("Не удалось извлечь user_id")
+                            
+                            # Определяем тип подписки из payload
+                            if '1month' in invoice_payload:
+                                subscription_days = 30
+                                amount = 99
+                            elif '3months' in invoice_payload:
+                                subscription_days = 90
+                                amount = 270
+                            else:
+                                logging.error(f"❌ Не удалось определить тип подписки из payload: {invoice_payload}")
+                                return None
                                 
                                 # Создаем запись о платеже вручную
                                 logging.warning(f"⚠️ Создаем запись о платеже вручную для user_id={user_id}")
@@ -916,44 +1063,88 @@ async def complete_payment(
             user_id = row["user_id"]
             subscription_days = row["subscription_days"]
             
-            # Обновляем статус платежа
-            await db.execute("""
-                UPDATE payments
-                SET status = 'completed',
-                    provider_payment_charge_id = ?,
-                    completed_at = ?
-                WHERE invoice_payload = ?
-            """, (provider_payment_charge_id, now.isoformat(), invoice_payload))
-            
-            # Активируем премиум-подписку
-            # Получаем текущую дату окончания премиума (если есть)
-            async with db.execute("""
-                SELECT premium_until FROM user_premium WHERE user_id = ?
-            """, (user_id,)) as cursor2:
-                existing_row = await cursor2.fetchone()
-                if existing_row and existing_row["premium_until"]:
-                    # Если подписка уже есть, продлеваем её
-                    current_until = datetime.fromisoformat(existing_row["premium_until"])
-                    if current_until > now:
-                        # Подписка еще активна - продлеваем от текущей даты окончания
-                        new_until = current_until + timedelta(days=subscription_days)
+                # Обновляем статус платежа
+                await db.execute("""
+                    UPDATE payments
+                    SET status = 'completed',
+                        provider_payment_charge_id = ?,
+                        completed_at = ?
+                    WHERE invoice_payload = ?
+                """, (provider_payment_charge_id, now.isoformat(), invoice_payload))
+                
+                # Активируем премиум-подписку
+                # Получаем текущую дату окончания премиума (если есть)
+                async with db.execute("""
+                    SELECT premium_until FROM user_premium WHERE user_id = ?
+                """, (user_id,)) as cursor2:
+                    existing_row = await cursor2.fetchone()
+                    if existing_row and existing_row["premium_until"]:
+                        # Если подписка уже есть, продлеваем её
+                        current_until = datetime.fromisoformat(existing_row["premium_until"])
+                        if current_until > now:
+                            # Подписка еще активна - продлеваем от текущей даты окончания
+                            new_until = current_until + timedelta(days=subscription_days)
+                        else:
+                            # Подписка истекла - начинаем с сегодня
+                            new_until = now + timedelta(days=subscription_days)
                     else:
-                        # Подписка истекла - начинаем с сегодня
+                        # Нет активной подписки - начинаем с сегодня
                         new_until = now + timedelta(days=subscription_days)
-                else:
-                    # Нет активной подписки - начинаем с сегодня
-                    new_until = now + timedelta(days=subscription_days)
-            
-            # Устанавливаем премиум-статус
+                
+            # Устанавливаем премиум-статус (эта функция сама управляет подключением)
             await set_user_premium(user_id, True, new_until)
             
             await db.commit()
+            
+            # Закрываем соединение перед возвратом
+            await db.close()
             
             return {
                 "user_id": user_id,
                 "subscription_days": subscription_days,
                 "premium_until": new_until
             }
+        except aiosqlite.OperationalError as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt)
+                logging.warning(f"⚠️ БД заблокирована при обработке платежа '{invoice_payload}', попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logging.error(f"❌ Ошибка БД при обработке платежа '{invoice_payload}': {e}")
+                raise
+        except Exception as e:
+            if db:
+                try:
+                    await db.close()
+                except:
+                    pass
+            logging.error(f"❌ Неожиданная ошибка при обработке платежа '{invoice_payload}': {e}", exc_info=True)
+            raise
+    
+    # Если все попытки исчерпаны
+    logging.error(f"❌ Не удалось обработать платеж '{invoice_payload}' после {MAX_RETRIES} попыток")
+    return None
+            except aiosqlite.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAY * (2 ** attempt)
+                    logging.warning(f"⚠️ БД заблокирована при обработке платежа, попытка {attempt + 1}/{MAX_RETRIES}, ждем {delay:.2f}с...")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    logging.error(f"❌ Ошибка БД при обработке платежа: {e}")
+                    raise
+            except Exception as e:
+                logging.error(f"❌ Неожиданная ошибка при обработке платежа: {e}", exc_info=True)
+                raise
+        finally:
+            if db:
+                await db.close()
 
 # ---------- Уведомления о истечении премиума ----------
 async def get_users_with_expiring_premium(min_days: int = 3, max_days: int = 5) -> List[tuple]:
