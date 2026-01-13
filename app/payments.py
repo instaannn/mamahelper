@@ -5,6 +5,7 @@
 """
 import logging
 import os
+import aiosqlite
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 import uuid

@@ -1220,50 +1220,73 @@ async def complete_yookassa_payment(
                             notification_sent = None
                         
                         payment_status = row2["status"]
+                        user_id_from_payment = row2["user_id"]
+                        subscription_days_from_payment = row2["subscription_days"] or 30
+                        
                         logging.info(f"ℹ️ Платеж с yookassa_payment_id '{yookassa_payment_id}' уже обработан (статус: {payment_status})")
                         
-                        # Если платеж уже completed, но премиум не активирован - активируем его
-                        if payment_status == "completed":
-                            user_id_from_payment = row2["user_id"]
-                            subscription_days_from_payment = row2["subscription_days"]
+                        # Проверяем, есть ли премиум у пользователя
+                        async with db.execute("""
+                            SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?
+                        """, (user_id_from_payment,)) as premium_check_cursor:
+                            premium_check_row = await premium_check_cursor.fetchone()
                             
-                            # Проверяем, есть ли премиум у пользователя
-                            async with db.execute("""
-                                SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?
-                            """, (user_id_from_payment,)) as premium_check_cursor:
-                                premium_check_row = await premium_check_cursor.fetchone()
+                            # Проверяем, активирован ли премиум
+                            is_premium_active = False
+                            if premium_check_row:
+                                is_premium_value = premium_check_row["is_premium"]
+                                is_premium_bool = bool(int(is_premium_value)) if is_premium_value is not None else False
+                                premium_until_str = premium_check_row["premium_until"]
                                 
-                                if not premium_check_row or not premium_check_row["is_premium"] or not premium_check_row["premium_until"]:
-                                    logging.warning(f"⚠️ Платеж {yookassa_payment_id} completed, но премиум не активирован! Активируем...")
-                                    # Активируем премиум
-                                    now = datetime.now(timezone.utc)
-                                    if premium_check_row and premium_check_row["premium_until"]:
-                                        current_until = datetime.fromisoformat(premium_check_row["premium_until"])
-                                        if current_until > now:
-                                            new_until = current_until + timedelta(days=subscription_days_from_payment)
-                                        else:
-                                            new_until = now + timedelta(days=subscription_days_from_payment)
+                                if is_premium_bool and premium_until_str:
+                                    premium_until_dt = datetime.fromisoformat(premium_until_str)
+                                    if premium_until_dt > now:
+                                        is_premium_active = True
+                            
+                            # Если платеж completed, но премиум не активирован - активируем его
+                            if payment_status == "completed" and not is_premium_active:
+                                logging.warning(f"⚠️ Платеж {yookassa_payment_id} completed, но премиум не активирован! Активируем...")
+                                # Активируем премиум
+                                if premium_check_row and premium_check_row["premium_until"]:
+                                    current_until = datetime.fromisoformat(premium_check_row["premium_until"])
+                                    if current_until > now:
+                                        new_until = current_until + timedelta(days=subscription_days_from_payment)
                                     else:
                                         new_until = now + timedelta(days=subscription_days_from_payment)
-                                    
-                                    await db.execute("""
-                                        INSERT OR REPLACE INTO user_premium
-                                        (user_id, is_premium, premium_until, created_at, updated_at)
-                                        VALUES (?, 1, ?, 
-                                            COALESCE((SELECT created_at FROM user_premium WHERE user_id = ?), ?),
-                                            ?)
-                                    """, (user_id_from_payment, new_until.isoformat(), user_id_from_payment, now.isoformat(), now.isoformat()))
-                                    await db.commit()
-                                    logging.info(f"✅ Премиум активирован для user_id={user_id_from_payment} до {new_until.isoformat()} (восстановление после ошибки)")
-                                    
-                                    return {
-                                        "user_id": user_id_from_payment,
-                                        "subscription_days": subscription_days_from_payment,
-                                        "premium_until": new_until,
-                                        "payment_id": yookassa_payment_id
-                                    }
                                 else:
-                                    logging.info(f"ℹ️ Премиум уже активирован для user_id={user_id_from_payment}")
+                                    new_until = now + timedelta(days=subscription_days_from_payment)
+                                
+                                await db.execute("""
+                                    INSERT OR REPLACE INTO user_premium
+                                    (user_id, is_premium, premium_until, created_at, updated_at)
+                                    VALUES (?, 1, ?, 
+                                        COALESCE((SELECT created_at FROM user_premium WHERE user_id = ?), ?),
+                                        ?)
+                                """, (user_id_from_payment, new_until.isoformat(), user_id_from_payment, now.isoformat(), now.isoformat()))
+                                await db.commit()
+                                
+                                # Проверяем, что премиум действительно активирован
+                                async with db.execute("""
+                                    SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?
+                                """, (user_id_from_payment,)) as verify_cursor:
+                                    verify_row = await verify_cursor.fetchone()
+                                    if verify_row:
+                                        verify_is_premium = bool(int(verify_row["is_premium"])) if verify_row["is_premium"] is not None else False
+                                        if verify_is_premium:
+                                            logging.info(f"✅ Премиум активирован для user_id={user_id_from_payment} до {new_until.isoformat()} (восстановление после ошибки)")
+                                        else:
+                                            logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не сохранился для user_id={user_id_from_payment}!")
+                                
+                                return {
+                                    "user_id": user_id_from_payment,
+                                    "subscription_days": subscription_days_from_payment,
+                                    "premium_until": new_until,
+                                    "payment_id": yookassa_payment_id
+                                }
+                            elif is_premium_active:
+                                logging.info(f"ℹ️ Премиум уже активирован для user_id={user_id_from_payment}")
+                            else:
+                                logging.warning(f"⚠️ Платеж {yookassa_payment_id} имеет статус {payment_status}, но премиум не активирован")
                         
                         # Возвращаем None, чтобы не отправлять уведомление повторно
                         return None
@@ -1324,10 +1347,24 @@ async def complete_yookassa_payment(
             """, (user_id, new_until.isoformat(), user_id, now.isoformat(), now.isoformat()))
             await db.commit()
             
-            logging.info(
-                f"✅ Премиум активирован для user_id={user_id} до {new_until.isoformat()} "
-                f"(платеж: {yookassa_payment_id})"
-            )
+            # Проверяем, что премиум действительно активирован
+            async with db.execute("""
+                SELECT is_premium, premium_until FROM user_premium WHERE user_id = ?
+            """, (user_id,)) as verify_cursor:
+                verify_row = await verify_cursor.fetchone()
+                if verify_row:
+                    verify_is_premium = bool(int(verify_row["is_premium"])) if verify_row["is_premium"] is not None else False
+                    if verify_is_premium:
+                        logging.info(
+                            f"✅ Премиум активирован для user_id={user_id} до {new_until.isoformat()} "
+                            f"(платеж: {yookassa_payment_id})"
+                        )
+                    else:
+                        logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не сохранился для user_id={user_id} после активации!")
+                        raise ValueError(f"Премиум не сохранился в БД для user_id={user_id}")
+                else:
+                    logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Запись о премиум не найдена после активации для user_id={user_id}!")
+                    raise ValueError(f"Запись о премиум не найдена после активации для user_id={user_id}")
             
             return {
                 "user_id": user_id,
@@ -1359,6 +1396,45 @@ async def mark_payment_notification_sent(yookassa_payment_id: str) -> None:
             logging.info(f"✅ Отмечено, что уведомление отправлено для платежа {yookassa_payment_id}")
     except Exception as e:
         logging.error(f"❌ Ошибка при отметке отправки уведомления для платежа {yookassa_payment_id}: {e}", exc_info=True)
+
+
+async def get_user_recent_payments(user_id: int, hours: int = 24) -> List[dict]:
+    """
+    Получить список недавних платежей пользователя для проверки статуса.
+    
+    Args:
+        user_id: ID пользователя
+        hours: Количество часов назад для поиска платежей (по умолчанию 24)
+    
+    Returns:
+        Список словарей с информацией о платежах (yookassa_payment_id, status, created_at)
+    """
+    try:
+        async with _get_db() as db:
+            db.row_factory = aiosqlite.Row
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
+            
+            async with db.execute("""
+                SELECT yookassa_payment_id, status, created_at
+                FROM payments
+                WHERE user_id = ? 
+                  AND yookassa_payment_id IS NOT NULL
+                  AND created_at >= ?
+                ORDER BY created_at DESC
+                LIMIT 10
+            """, (user_id, cutoff_time.isoformat())) as cursor:
+                rows = await cursor.fetchall()
+                payments = []
+                for row in rows:
+                    payments.append({
+                        "payment_id": row["yookassa_payment_id"],
+                        "status": row["status"],
+                        "created_at": row["created_at"]
+                    })
+                return payments
+    except Exception as e:
+        logging.error(f"❌ Ошибка при получении платежей пользователя {user_id}: {e}", exc_info=True)
+        return []
 
 # ---------- Уведомления о истечении премиума ----------
 async def get_users_with_expiring_premium(min_days: int = 3, max_days: int = 5) -> List[tuple]:
