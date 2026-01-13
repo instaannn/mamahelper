@@ -26,9 +26,10 @@ from app.storage import (
     track_user_interaction, get_bot_statistics,
     disable_expired_premium_subscriptions, DB_PATH, mark_payment_notification_sent
 )
+from app.storage import _get_db
 from app.utils import is_premium_user
 from app.payments import create_payment, is_yookassa_configured, get_payment_status, check_pending_payments
-from app.storage import complete_yookassa_payment, mark_payment_notification_sent, mark_payment_notification_sent
+from app.storage import complete_yookassa_payment
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -1683,8 +1684,7 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
                         try:
                             # Проверяем, не было ли уже отправлено уведомление для этого платежа
                             # (защита от дублирования при одновременной обработке)
-                            import aiosqlite
-                            async with aiosqlite.connect(DB_PATH) as check_db:
+                            async with _get_db() as check_db:
                                 check_db.row_factory = aiosqlite.Row
                                 async with check_db.execute("""
                                     SELECT notification_sent_at FROM payments
@@ -1721,9 +1721,7 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
                     logging.info(f"ℹ️ Платеж {payment_id} отменен")
                     # Обновляем статус в БД, чтобы не проверять его повторно
                     try:
-                        from app.storage import DB_PATH
-                        import aiosqlite
-                        async with aiosqlite.connect(DB_PATH, timeout=10.0) as db:
+                        async with _get_db() as db:
                             await db.execute("""
                                 UPDATE payments
                                 SET status = 'canceled'
@@ -2140,8 +2138,7 @@ def main():
                 
                 if is_premium:
                     # Получаем информацию о подписке
-                    import aiosqlite
-                    async with aiosqlite.connect(DB_PATH, timeout=30.0) as db:
+                    async with _get_db() as db:
                         db.row_factory = aiosqlite.Row
                         async with db.execute(
                             "SELECT premium_until FROM user_premium WHERE user_id = ?",

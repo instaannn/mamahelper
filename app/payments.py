@@ -289,13 +289,12 @@ async def check_pending_payments() -> list:
     Returns:
         Список словарей с информацией о pending платежах (yookassa_payment_id, user_id)
     """
-    import aiosqlite
-    from app.storage import DB_PATH
+    from app.storage import _get_db
     
     pending_payments = []
     
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _get_db() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("""
                 SELECT yookassa_payment_id, user_id
