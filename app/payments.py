@@ -5,9 +5,11 @@
 """
 import logging
 import os
+import asyncio
 import aiosqlite
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+from decimal import Decimal
 import uuid
 from dotenv import load_dotenv
 
@@ -47,7 +49,7 @@ else:
 
 async def create_payment(
     user_id: int,
-    amount: float,
+    amount: Decimal,
     description: str,
     subscription_type: str,
     subscription_days: int,
@@ -61,7 +63,7 @@ async def create_payment(
     
     Args:
         user_id: ID пользователя Telegram
-        amount: Сумма платежа в рублях (например, 99.0)
+        amount: Сумма платежа в рублях (Decimal, например, Decimal("99.00"))
         description: Описание платежа
         subscription_type: Тип подписки ("1month" или "3months")
         subscription_days: Количество дней подписки (30 или 90)
@@ -106,7 +108,7 @@ async def create_payment(
         # все способы оплаты, активированные в личном кабинете ЮKassa (карты, СБП и др.)
         payment_data = {
             "amount": {
-                "value": f"{amount:.2f}",
+                "value": str(amount.quantize(Decimal("0.01"))),
                 "currency": "RUB"
             },
             "confirmation": {
@@ -123,63 +125,24 @@ async def create_payment(
             }
         }
         
-        # Если есть номер телефона или email пользователя, добавляем receipt для формирования чека
-        # Это необходимо, если библиотека yookassa автоматически добавляет receipt при включенной онлайн-кассе
-        # Если receipt указан, customer должен содержать валидный email или phone
-        if customer_phone or customer_email:
-            receipt_customer = {}
-            if customer_phone:
-                # Форматируем номер телефона (должен начинаться с +7 для России)
-                phone = customer_phone.strip()
-                if not phone.startswith("+"):
-                    if phone.startswith("8"):
-                        phone = "+7" + phone[1:]
-                    elif phone.startswith("7"):
-                        phone = "+" + phone
-                    else:
-                        phone = "+7" + phone
-                receipt_customer["phone"] = phone
-            if customer_email:
-                receipt_customer["email"] = customer_email.strip()
-            
-            if receipt_customer:
-                payment_data["receipt"] = {
-                    "customer": receipt_customer,
-                    "items": [
-                        {
-                            "description": description[:128],  # Максимум 128 символов
-                            "quantity": "1.00",
-                            "amount": {
-                                "value": f"{amount:.2f}",
-                                "currency": "RUB"
-                            },
-                            "vat_code": 1  # НДС 20%
-                        }
-                    ],
-                    "tax_system_code": 1  # Общая система налогообложения
-                }
-                logging.info(f"📝 Receipt добавлен с customer: {receipt_customer}")
-        else:
-            # Если нет phone/email, не добавляем receipt
-            # ЮKassa автоматически запросит email на странице оплаты, если онлайн-касса настроена
-            logging.info(f"💡 Receipt не добавлен (нет phone/email). ЮKassa запросит email автоматически.")
-        
+        # Не добавляем receipt в payment_data
+        # ЮKassa автоматически запросит email на странице оплаты для формирования чека, если онлайн-касса настроена
         logging.info(f"📋 Данные платежа: amount={amount} RUB, description={description}")
         logging.info(f"💡 Примечание: payment_method_data не указан - будут доступны все способы оплаты из личного кабинета ЮKassa")
+        logging.info(f"💡 Receipt не добавляется - ЮKassa запросит email автоматически при необходимости")
         
         # Логируем payment_data для отладки (без секретных данных)
         import json
         payment_data_str = json.dumps(payment_data, ensure_ascii=False, indent=2)
         logging.info(f"🔍 Payment data перед отправкой:\n{payment_data_str}")
         
-        # Убеждаемся, что receipt НЕ указан в payment_data
-        if "receipt" in payment_data:
-            logging.warning(f"⚠️ ВНИМАНИЕ: receipt найден в payment_data! Удаляем его.")
-            del payment_data["receipt"]
-            logging.info(f"🔍 Payment data после удаления receipt:\n{json.dumps(payment_data, ensure_ascii=False, indent=2)}")
-        
         try:
-            payment = Payment.create(payment_data, idempotence_key)
+            # Выполняем синхронный вызов Payment.create() в отдельном потоке, чтобы не блокировать event loop
+            payment = await asyncio.to_thread(
+                Payment.create,
+                payment_data,
+                idempotence_key
+            )
         except ValueError as ve:
             # Если ошибка связана с receipt, логируем подробности
             if "receipt" in str(ve).lower() or "customer" in str(ve).lower():
@@ -246,7 +209,11 @@ async def get_payment_status(payment_id: str) -> Optional[Dict[str, Any]]:
         return None
     
     try:
-        payment = Payment.find_one(payment_id)
+        # Выполняем синхронный вызов Payment.find_one() в отдельном потоке, чтобы не блокировать event loop
+        payment = await asyncio.to_thread(
+            Payment.find_one,
+            payment_id
+        )
         
         # Получаем информацию о чеке, если она доступна
         receipt_info = None
@@ -298,7 +265,7 @@ async def check_pending_payments() -> list:
         async with _get_db() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("""
-                SELECT yookassa_payment_id, user_id
+                SELECT yookassa_payment_id, user_id, created_at
                 FROM payments
                 WHERE status = 'pending' AND yookassa_payment_id IS NOT NULL
                 ORDER BY created_at DESC
@@ -308,8 +275,11 @@ async def check_pending_payments() -> list:
                 for row in rows:
                     pending_payments.append({
                         "payment_id": row["yookassa_payment_id"],
-                        "user_id": row["user_id"]
+                        "user_id": row["user_id"],
+                        "created_at": row["created_at"]
                     })
+                if rows:
+                    logging.debug(f"📋 Найдено {len(rows)} pending платежей в БД")
     except Exception as e:
         logging.error(f"❌ Ошибка при получении pending платежей: {e}", exc_info=True)
     

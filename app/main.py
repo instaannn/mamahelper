@@ -8,6 +8,7 @@ import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta, time as dt_time
+from decimal import Decimal
 
 from telegram import Update, LabeledPrice
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters, PreCheckoutQueryHandler
@@ -25,7 +26,8 @@ from app.storage import (
     save_payment, complete_payment,
     track_user_interaction, get_bot_statistics,
     disable_expired_premium_subscriptions, DB_PATH, mark_payment_notification_sent,
-    get_user_recent_payments
+    get_user_recent_payments, force_activate_premium_from_payment,
+    get_all_recent_payments_without_premium
 )
 from app.storage import _get_db
 from app.utils import is_premium_user
@@ -105,7 +107,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         command_args = update.message.text.split() if update.message.text else []
         if len(command_args) > 1 and command_args[1] == "payment_success":
             # Пользователь вернулся после оплаты
-            logging.info(f"💰 Пользователь {user_id} вернулся после оплаты - проверяем платежи")
+            logging.info(f"💰 [RETURN] Пользователь {user_id} вернулся после оплаты - начинаем проверку платежей")
             # Проверяем статус платежей пользователя немедленно
             if is_yookassa_configured():
                 try:
@@ -113,9 +115,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await check_yookassa_payments_status(context)
                     
                     # Затем проверяем платежи конкретного пользователя за последние 24 часа
+                    logging.info(f"🔍 [RETURN] Получение недавних платежей пользователя {user_id}...")
                     user_payments = await get_user_recent_payments(user_id, hours=24)
                     if user_payments:
-                        logging.info(f"🔍 Найдено {len(user_payments)} платежей пользователя {user_id} за последние 24 часа")
+                        logging.info(f"🔍 [RETURN] Найдено {len(user_payments)} платежей пользователя {user_id} за последние 24 часа")
                         premium_activated = False
                         
                         for payment_info in user_payments:
@@ -132,12 +135,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     continue
                                 
                                 yookassa_status = payment_status.get("status")
-                                logging.info(f"📊 Статус платежа {payment_id} в ЮKassa: {yookassa_status}")
+                                paid = payment_status.get("paid", False)
+                                logging.info(f"📊 Статус платежа {payment_id} в ЮKassa: {yookassa_status}, paid: {paid}")
                                 
-                                # Если платеж успешно оплачен в ЮKassa
+                                # ВАЖНО: Активируем премиум только при статусе "succeeded" (окончательно списан)
+                                # waiting_for_capture означает, что деньги зарезервированы, но еще не списаны окончательно
                                 if yookassa_status == "succeeded":
-                                    logging.info(f"✅ Платеж {payment_id} успешно оплачен в ЮKassa, активируем премиум для user_id={user_id}")
+                                    logging.info(f"✅ [RETURN] Платеж {payment_id} имеет статус 'succeeded' (оплачен и списан), активируем премиум для user_id={user_id}")
                                     result = await complete_yookassa_payment(payment_id)
+                                elif yookassa_status == "waiting_for_capture" and paid:
+                                    logging.info(f"ℹ️ [RETURN] Платеж {payment_id} имеет статус 'waiting_for_capture' (деньги зарезервированы). Премиум будет активирован после перехода в 'succeeded'")
+                                    continue
+                                else:
+                                    logging.debug(f"ℹ️ [RETURN] Платеж {payment_id} имеет статус {yookassa_status}, paid={paid}, не требует активации")
+                                    continue
                                     
                                     if result:
                                         logging.info(f"✅ complete_yookassa_payment вернул результат для платежа {payment_id}")
@@ -161,29 +172,64 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                             except Exception as manual_error:
                                                 logging.error(f"❌ Не удалось активировать премиум вручную: {manual_error}", exc_info=True)
                                     else:
-                                        logging.warning(f"⚠️ complete_yookassa_payment вернул None для платежа {payment_id}")
-                                        # Пытаемся активировать премиум напрямую, если платеж succeeded
+                                        logging.warning(f"⚠️ complete_yookassa_payment вернул None для платежа {payment_id}, пытаемся принудительно активировать")
+                                        # Пытаемся принудительно активировать премиум
                                         try:
-                                            # Получаем информацию о платеже из БД
-                                            async with _get_db() as db:
-                                                db.row_factory = aiosqlite.Row
-                                                async with db.execute("""
-                                                    SELECT user_id, subscription_days
-                                                    FROM payments
-                                                    WHERE yookassa_payment_id = ?
-                                                """, (payment_id,)) as cursor:
-                                                    payment_row = await cursor.fetchone()
-                                                    if payment_row:
-                                                        sub_days = payment_row["subscription_days"] or 30
+                                            result = await force_activate_premium_from_payment(payment_id)
+                                            if result:
+                                                logging.info(f"✅ Премиум принудительно активирован для user_id={user_id} (платеж {payment_id})")
+                                                premium_activated = True
+                                                
+                                                # Проверяем, что премиум действительно активирован
+                                                has_premium = await is_user_premium(user_id)
+                                                if not has_premium:
+                                                    logging.error(f"❌ Премиум все еще не активирован после force_activate_premium_from_payment для user_id={user_id}!")
+                                                    # Последняя попытка - активируем напрямую
+                                                    sub_days = result.get("subscription_days", 30)
+                                                    premium_until = result.get("premium_until")
+                                                    if not premium_until:
                                                         premium_until = datetime.now(timezone.utc) + timedelta(days=sub_days)
-                                                        await set_user_premium(user_id, True, premium_until)
-                                                        logging.info(f"✅ Премиум активирован напрямую для user_id={user_id} (платеж {payment_id})")
-                                                        premium_activated = True
-                                        except Exception as direct_error:
-                                            logging.error(f"❌ Ошибка при прямой активации премиума: {direct_error}", exc_info=True)
+                                                    await set_user_premium(user_id, True, premium_until)
+                                                    logging.info(f"✅ Премиум активирован напрямую через set_user_premium для user_id={user_id}")
+                                                    premium_activated = True
+                                            else:
+                                                logging.error(f"❌ force_activate_premium_from_payment вернул None для платежа {payment_id}")
+                                        except Exception as force_error:
+                                            logging.error(f"❌ Ошибка при принудительной активации премиума: {force_error}", exc_info=True)
                                     
                                     # Прерываем цикл, если премиум активирован
                                     if premium_activated:
+                                        # Отправляем уведомление пользователю
+                                        try:
+                                            premium_until = result.get("premium_until") if result else None
+                                            subscription_days = result.get("subscription_days", 30) if result else 30
+                                            
+                                            if premium_until:
+                                                moscow_tz = timezone(timedelta(hours=3))
+                                                until_local = premium_until.astimezone(moscow_tz)
+                                                until_str = until_local.strftime("%d.%m.%Y")
+                                            else:
+                                                until_str = "неизвестно"
+                                            
+                                            success_text = (
+                                                f"✅ **Платеж успешно обработан!**\n\n"
+                                                f"✨ Ваша премиум-подписка активирована на {subscription_days} дней!\n\n"
+                                                f"📅 Подписка действует до: {until_str}\n\n"
+                                                f"Теперь вам доступны все премиум-функции:\n"
+                                                f"• 👶 Профиль ребенка\n"
+                                                f"• 📊 Дневник лекарств\n"
+                                                f"• 🚩 Красные флаги\n\n"
+                                                f"Спасибо за поддержку! 💚"
+                                            )
+                                            
+                                            home_keyboard = InlineKeyboardMarkup([
+                                                [InlineKeyboardButton("🏠 На главную", callback_data="start_home")]
+                                            ])
+                                            
+                                            await update.message.reply_text(success_text, parse_mode="Markdown", reply_markup=home_keyboard)
+                                            logging.info(f"✅ Уведомление об активации премиума отправлено пользователю {user_id}")
+                                        except Exception as notify_error:
+                                            logging.error(f"❌ Ошибка при отправке уведомления пользователю {user_id}: {notify_error}", exc_info=True)
                                         break
                                         
                             except Exception as payment_check_error:
@@ -993,7 +1039,7 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
     
     if query.data == "premium_buy_1month":
         # Премиум на 1 месяц - 99₽
-        amount = 99.0
+        amount = Decimal("99.00")
         subscription_type = "1month"
         subscription_days = 30
         title = "🌟 Премиум-подписка на 1 месяц"
@@ -1124,7 +1170,7 @@ async def handle_premium_buttons(update: Update, context: ContextTypes.DEFAULT_T
     
     elif query.data == "premium_buy_3months":
         # Премиум на 3 месяца - 270₽
-        amount = 270.0
+        amount = Decimal("270.00")
         subscription_type = "3months"
         subscription_days = 90
         title = "🌟 Премиум-подписка на 3 месяца"
@@ -1695,16 +1741,40 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
     Если платеж успешно оплачен, активирует премиум.
     """
     if not is_yookassa_configured():
+        logging.debug("ℹ️ ЮKassa не настроен, пропускаем проверку платежей")
         return  # ЮKassa не настроен, пропускаем проверку
     
     try:
         # Получаем список pending платежей
+        logging.debug("🔍 Начинаем проверку pending платежей...")
         pending_payments = await check_pending_payments()
         
-        if not pending_payments:
-            return  # Нет pending платежей
+        # Также проверяем оплаченные платежи без премиума
+        payments_without_premium = await get_all_recent_payments_without_premium(hours=24)
         
-        logging.info(f"🔍 Проверка статуса {len(pending_payments)} pending платежей через ЮKassa...")
+        if not pending_payments and not payments_without_premium:
+            logging.debug("ℹ️ Нет pending платежей и платежей без премиума для проверки")
+            return  # Нет платежей для проверки
+        
+        if pending_payments:
+            logging.info(f"🔍 Проверка статуса {len(pending_payments)} pending платежей через ЮKassa...")
+        
+        if payments_without_premium:
+            logging.warning(f"⚠️ Найдено {len(payments_without_premium)} оплаченных платежей без премиума, активируем...")
+            for payment_info in payments_without_premium:
+                payment_id = payment_info["payment_id"]
+                user_id = payment_info["user_id"]
+                try:
+                    result = await force_activate_premium_from_payment(payment_id)
+                    if result:
+                        logging.info(f"✅ Премиум активирован для user_id={user_id} (платеж {payment_id})")
+                    else:
+                        logging.error(f"❌ Не удалось активировать премиум для user_id={user_id} (платеж {payment_id})")
+                except Exception as e:
+                    logging.error(f"❌ Ошибка при активации премиума для платежа {payment_id}: {e}", exc_info=True)
+        
+        if not pending_payments:
+            return  # Нет pending платежей для проверки
         
         for payment_info in pending_payments:
             payment_id = payment_info["payment_id"]
@@ -1715,42 +1785,58 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
                 payment_status = await get_payment_status(payment_id)
                 
                 if not payment_status:
+                    logging.warning(f"⚠️ Не удалось получить статус платежа {payment_id} из ЮKassa")
                     continue  # Не удалось получить статус, пропускаем
                 
                 status = payment_status.get("status")
+                paid = payment_status.get("paid", False)
+                logging.debug(f"📊 Платеж {payment_id} (user_id={user_id}): статус={status}, paid={paid}")
                 
+                # Проверяем succeeded или waiting_for_capture с paid=True
+                # ВАЖНО: Активируем премиум только при succeeded (окончательно списан)
+                # waiting_for_capture означает, что деньги зарезервированы, но еще не списаны
                 if status == "succeeded":
-                    # Платеж успешно оплачен - активируем премиум
-                    logging.info(f"✅ Платеж {payment_id} успешно оплачен, активируем премиум для user_id={user_id}")
+                    # Платеж успешно оплачен и списан - активируем премиум
+                    logging.info(f"✅ [CHECK] Платеж {payment_id} имеет статус 'succeeded' (оплачен и списан), активируем премиум для user_id={user_id}")
                     
                     result = await complete_yookassa_payment(payment_id)
                     
                     # Если result None, но платеж succeeded - проверяем, может быть премиум уже активирован
                     if not result:
-                        logging.warning(f"⚠️ complete_yookassa_payment вернул None для платежа {payment_id}, проверяем статус премиума...")
+                        logging.warning(f"⚠️ [CHECK] complete_yookassa_payment вернул None для платежа {payment_id}, проверяем статус премиума...")
                         # Проверяем, есть ли премиум у пользователя
                         from app.storage import is_user_premium
                         has_premium = await is_user_premium(user_id)
                         if has_premium:
-                            logging.info(f"ℹ️ Премиум уже активирован для user_id={user_id}, пропускаем отправку уведомления")
+                            logging.info(f"ℹ️ [CHECK] Премиум уже активирован для user_id={user_id}, пропускаем отправку уведомления")
                             continue
                         else:
-                            logging.error(f"❌ Премиум НЕ активирован для user_id={user_id} после успешной оплаты платежа {payment_id}!")
+                            logging.error(f"❌ [CHECK] Премиум НЕ активирован для user_id={user_id} после успешной оплаты платежа {payment_id}!")
                             # Пытаемся активировать вручную
                             try:
-                                from app.storage import set_user_premium
-                                premium_until = datetime.now(timezone.utc) + timedelta(days=30)  # По умолчанию 30 дней
-                                await set_user_premium(user_id, True, premium_until)
-                                logging.info(f"✅ Премиум активирован вручную для user_id={user_id}")
-                                result = {
-                                    "user_id": user_id,
-                                    "subscription_days": 30,
-                                    "premium_until": premium_until,
-                                    "payment_id": payment_id
-                                }
+                                from app.storage import set_user_premium, force_activate_premium_from_payment
+                                # Сначала пробуем force_activate_premium_from_payment
+                                result = await force_activate_premium_from_payment(payment_id)
+                                if not result:
+                                    # Если не получилось, активируем вручную с дефолтными значениями
+                                    premium_until = datetime.now(timezone.utc) + timedelta(days=30)  # По умолчанию 30 дней
+                                    await set_user_premium(user_id, True, premium_until)
+                                    logging.info(f"✅ [CHECK] Премиум активирован вручную для user_id={user_id}")
+                                    result = {
+                                        "user_id": user_id,
+                                        "subscription_days": 30,
+                                        "premium_until": premium_until,
+                                        "payment_id": payment_id
+                                    }
                             except Exception as manual_error:
-                                logging.error(f"❌ Не удалось активировать премиум вручную: {manual_error}", exc_info=True)
+                                logging.error(f"❌ [CHECK] Не удалось активировать премиум вручную: {manual_error}", exc_info=True)
                                 continue
+                elif status == "waiting_for_capture" and paid:
+                    # Платеж ожидает подтверждения списания - НЕ активируем премиум, только логируем
+                    logging.info(f"ℹ️ [CHECK] Платеж {payment_id} имеет статус 'waiting_for_capture' (деньги зарезервированы, но не списаны). Премиум будет активирован после перехода в 'succeeded'")
+                    continue
+                else:
+                    logging.debug(f"ℹ️ [CHECK] Платеж {payment_id} имеет статус {status}, paid={paid}, не требует активации премиума")
                     
                     if result:
                         # Отправляем уведомление пользователю
@@ -1840,6 +1926,8 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
         
     except Exception as e:
         logging.error(f"❌ Ошибка при проверке статуса платежей ЮKassa: {e}", exc_info=True)
+    finally:
+        logging.debug("✅ Задача проверки платежей завершена")
 
 async def post_init(application: Application) -> None:
     """Инициализация БД при старте приложения."""
@@ -2222,6 +2310,90 @@ def main():
         
         application.add_handler(CommandHandler("activate_premium", activate_premium_command))
         
+        # Команда для отключения премиума администратором
+        async def deactivate_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Отключение премиума администратором (формат: /deactivate_premium user_id)."""
+            if not update.message:
+                return
+            
+            user_id = update.effective_user.id
+            
+            # Проверяем, является ли пользователь администратором
+            if not ADMIN_USER_ID or user_id != ADMIN_USER_ID:
+                await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+                return
+            
+            try:
+                # Парсим аргументы: /deactivate_premium user_id
+                args = context.args
+                if len(args) < 1:
+                    await update.message.reply_text(
+                        "Использование: /deactivate_premium <user_id>\n\n"
+                        "Пример: /deactivate_premium 123456789\n\n"
+                        "⚠️ Это отключит премиум у пользователя немедленно."
+                    )
+                    return
+                
+                target_user_id = int(args[0])
+                
+                # Проверяем текущий статус премиума
+                current_premium = await is_user_premium(target_user_id)
+                if not current_premium:
+                    await update.message.reply_text(
+                        f"ℹ️ У пользователя {target_user_id} уже нет активного премиума."
+                    )
+                    return
+                
+                # Отключаем премиум
+                await set_user_premium(target_user_id, False, None)
+                
+                # Проверяем, что премиум действительно отключен
+                is_premium = await is_user_premium(target_user_id)
+                if is_premium:
+                    logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Премиум не отключен для user_id={target_user_id} после вызова set_user_premium!")
+                    await update.message.reply_text(
+                        f"⚠️ Ошибка: Премиум не отключен в БД.\n\n"
+                        f"Проверьте логи для деталей.\n"
+                        f"User ID: {target_user_id}"
+                    )
+                    return
+                
+                await update.message.reply_text(
+                    f"✅ Премиум отключен!\n\n"
+                    f"User ID: {target_user_id}\n"
+                    f"✅ Проверка: Премиум статус подтвержден в БД (отключен)"
+                )
+                
+                logging.info(f"🔧 Admin {user_id} отключил премиум для user_id={target_user_id}")
+                
+                # Опционально: отправляем уведомление пользователю
+                try:
+                    await context.bot.send_message(
+                        chat_id=target_user_id,
+                        text=(
+                            f"ℹ️ **Ваш премиум-доступ был отключен администратором.**\n\n"
+                            f"Если у вас есть вопросы, пожалуйста, свяжитесь с поддержкой.\n\n"
+                            f"💡 Вы можете продлить подписку через /premium"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                except Exception as notify_error:
+                    logging.warning(f"Не удалось отправить уведомление пользователю {target_user_id}: {notify_error}")
+                
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Ошибка: user_id должен быть числом.\n\n"
+                    "Использование: /deactivate_premium <user_id>"
+                )
+            except Exception as e:
+                logging.error(f"Error in deactivate_premium_command: {e}", exc_info=True)
+                await update.message.reply_text(
+                    f"❌ Произошла ошибка при отключении премиума.\n\n"
+                    f"Проверьте логи для деталей."
+                )
+        
+        application.add_handler(CommandHandler("deactivate_premium", deactivate_premium_command))
+        
         # Команда для проверки статуса премиума
         async def check_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """Проверить статус премиум-подписки."""
@@ -2345,6 +2517,25 @@ def main():
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_update_received))
         application.add_handler(CallbackQueryHandler(log_update_received, pattern=".*"))
 
+        # Опционально: запускаем webhook сервер для ЮKassa в отдельном потоке
+        # Это нужно только если у вас есть публичный HTTPS URL для получения webhook'ов
+        webhook_enabled = os.getenv('YOOKASSA_WEBHOOK_ENABLED', 'false').lower() == 'true'
+        if webhook_enabled and is_yookassa_configured():
+            try:
+                from app.webhook_server import start_webhook_server_thread
+                webhook_host = os.getenv('WEBHOOK_HOST', '0.0.0.0')
+                webhook_port = int(os.getenv('WEBHOOK_PORT', '8080'))
+                webhook_thread = start_webhook_server_thread(host=webhook_host, port=webhook_port)
+                logging.info(f"✅ Webhook сервер для ЮKassa запущен в отдельном потоке на {webhook_host}:{webhook_port}")
+                logging.info(f"💡 Для использования webhook настройте URL в личном кабинете ЮKassa: http://your-domain:{webhook_port}/webhooks/yookassa")
+            except Exception as e:
+                logging.warning(f"⚠️ Не удалось запустить webhook сервер: {e}")
+        else:
+            if not webhook_enabled:
+                logging.info("ℹ️ Webhook сервер отключен (YOOKASSA_WEBHOOK_ENABLED=false). Используется периодическая проверка платежей.")
+            else:
+                logging.info("ℹ️ ЮKassa не настроен, webhook сервер не запускается")
+        
         print("Бот запущен... (polling)")
         logging.info("Bot is ready to receive updates")
         application.run_polling(drop_pending_updates=True)
