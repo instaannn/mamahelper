@@ -938,6 +938,31 @@ async def save_payment(
     
     async with _get_db() as db:
         try:
+            # ВАЖНО: Перед сохранением платежа убеждаемся, что пользователь существует в user_premium
+            # Это необходимо из-за FOREIGN KEY constraint: payments.user_id -> user_premium.user_id
+            async with db.execute(
+                "SELECT user_id FROM user_premium WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                user_exists = await cursor.fetchone()
+                
+                if not user_exists:
+                    # Создаем запись пользователя в user_premium с is_premium=0
+                    import logging
+                    logging.info(f"ℹ️ [PAYMENT] Создание записи в user_premium для user_id={user_id} перед сохранением платежа")
+                    await db.execute("""
+                        INSERT INTO user_premium
+                        (user_id, is_premium, premium_until, created_at, updated_at)
+                        VALUES (?, 0, NULL, ?, ?)
+                    """, (
+                        user_id,
+                        now.isoformat(),
+                        now.isoformat()
+                    ))
+                    await db.commit()
+                    logging.info(f"✅ [PAYMENT] Запись в user_premium создана для user_id={user_id}")
+            
+            # Теперь сохраняем платеж
             await db.execute("""
                 INSERT INTO payments
                 (user_id, invoice_payload, amount, currency, subscription_type, subscription_days, 
