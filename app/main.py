@@ -5,6 +5,7 @@ import sys
 import subprocess
 import time
 import asyncio
+import aiosqlite
 from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta, time as dt_time
@@ -1831,13 +1832,8 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
                             except Exception as manual_error:
                                 logging.error(f"❌ [CHECK] Не удалось активировать премиум вручную: {manual_error}", exc_info=True)
                                 continue
-                elif status == "waiting_for_capture" and paid:
-                    # Платеж ожидает подтверждения списания - НЕ активируем премиум, только логируем
-                    logging.info(f"ℹ️ [CHECK] Платеж {payment_id} имеет статус 'waiting_for_capture' (деньги зарезервированы, но не списаны). Премиум будет активирован после перехода в 'succeeded'")
-                    continue
-                else:
-                    logging.debug(f"ℹ️ [CHECK] Платеж {payment_id} имеет статус {status}, paid={paid}, не требует активации премиума")
                     
+                    # Отправляем уведомление пользователю, если премиум активирован
                     if result:
                         # Отправляем уведомление пользователю
                         premium_until = result["premium_until"]
@@ -1900,6 +1896,10 @@ async def check_yookassa_payments_status(context: ContextTypes.DEFAULT_TYPE) -> 
                     else:
                         logging.warning(f"⚠️ Не удалось активировать премиум для платежа {payment_id}")
                 
+                elif status == "waiting_for_capture" and paid:
+                    # Платеж ожидает подтверждения списания - НЕ активируем премиум, только логируем
+                    logging.info(f"ℹ️ [CHECK] Платеж {payment_id} имеет статус 'waiting_for_capture' (деньги зарезервированы, но не списаны). Премиум будет активирован после перехода в 'succeeded'")
+                    continue
                 elif status == "canceled":
                     logging.info(f"ℹ️ Платеж {payment_id} отменен")
                     # Обновляем статус в БД, чтобы не проверять его повторно
